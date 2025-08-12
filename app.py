@@ -23,9 +23,10 @@ provider = st.sidebar.radio("Data Provider", ["Alpha Vantage", "FMP"])
 ticker = st.text_input("Enter ticker (e.g., AAPL, MSFT, ADBE):", value="MSFT").strip().upper()
 run = st.button("Search")
 
+# Secrets (set these in Streamlit Cloud: ⋮ → Edit secrets)
+OPENAI_KEY = st.secrets.get("OPENAI_API_KEY", "").strip()
 AV_KEY = st.secrets.get("ALPHAVANTAGE_API_KEY", "").strip()
 FMP_KEY = st.secrets.get("FMP_API_KEY", "").strip()
-OPENAI_KEY = st.secrets.get("OPENAI_API_KEY", "").strip()
 
 st.sidebar.markdown("### Valuation Assumptions")
 # Rule #1 EPS — app uses LOWER of (your estimate, 10y EPS CAGR, analyst 5y EPS growth), capped at 15%
@@ -42,7 +43,7 @@ terminal_g = st.sidebar.number_input("Terminal growth (FCF, %)", 0.0, 6.0, 3.0, 
 # Discount (MARR)
 discount = st.sidebar.number_input("MARR / Discount rate (%, both models)", 4.0, 20.0, 10.0, step=0.5) / 100.0
 
-# Default MOS in sidebar (used to prefill live sliders)
+# Default MOS in sidebar (prefills live sliders)
 st.sidebar.markdown("### Default MOS (prefill for live sliders)")
 mos_eps_pct_default = st.sidebar.slider("Default MOS for Rule #1 EPS (%)", 0, 90, 50, step=5) / 100.0
 mos_dcf_pct_default = st.sidebar.slider("Default MOS for FCF DCF (%)", 0, 90, 50, step=5) / 100.0
@@ -307,7 +308,7 @@ def get_price_fmp(symbol: str, apikey: str) -> float:
     except Exception:
         return np.nan
 
-# -------------------- Analyst 5y EPS growth (Yahoo Finance earningsTrend) --------------------
+# -------------------- Analyst 5y EPS growth (Yahoo Finance) --------------------
 @st.cache_data(show_spinner=False, ttl=3600)
 def get_analyst_eps_growth_5y(symbol: str) -> float:
     try:
@@ -466,7 +467,7 @@ if run:
     analyst_growth = get_analyst_eps_growth_5y(ticker)  # decimal (e.g., 0.12)
 
     # Historical EPS CAGR (10y)
-    eps_hist_cagr = eps_cagr_10
+    eps_hist_cagr = series_cagr_gap(df["EPS"])
 
     # Rule #1 growth used = lower of (user, hist, analyst), cap at 15%
     candidates = [g for g in [growth_eps_user, eps_hist_cagr, analyst_growth] if not pd.isna(g) and g >= 0]
