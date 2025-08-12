@@ -21,7 +21,7 @@ st.markdown(
 
 # =================== Header ===================
 st.title("Phil Town Big 5 Screener")
-st.caption("Big 5 (Sales, EPS, Equity, FCF CAGRs + 10-yr Avg ROIC), 10/5/3/1 breakdowns, and two valuations: Rule #1 EPS & FCF‑DCF. One MOS slider applies to both valuations.")
+st.caption("Big 5 (Sales, EPS, Equity, FCF CAGRs + 10-yr Avg ROIC), 10/5/3/1 breakdowns, and two valuations: Rule #1 EPS & FCF-DCF. One MOS slider applies to both valuations.")
 
 # =================== Secrets ===================
 AV_KEY  = st.secrets.get("ALPHAVANTAGE_API_KEY", "").strip()
@@ -29,7 +29,7 @@ FMP_KEY = st.secrets.get("FMP_API_KEY", "").strip()
 
 # =================== Session State ===================
 if "data" not in st.session_state:
-    st.session_state.data = None  # (df, years, source, diag, current_price, used_provider_name)
+    st.session_state.data = None  # (df, years, source, diag, current_price, provider_label)
 if "last_query" not in st.session_state:
     st.session_state.last_query = {"ticker": None, "provider": None}
 
@@ -110,6 +110,15 @@ def roic_series_from(nopat, debt, equity, cash):
     return roic
 
 def diag_counts(df): return {k:int(v) for k,v in df.notna().sum().to_dict().items()}
+
+def latest_positive(series, lookback=None):
+    """Return the most recent positive non-NaN value (optionally within last N points)."""
+    s = series.dropna()
+    if lookback is not None:
+        s = s.iloc[-lookback:]
+    s = s[s > 0]
+    if s.empty: return np.nan
+    return s.iloc[-1]
 
 # =================== Providers ===================
 AV_BASE  = "https://www.alphavantage.co/query"
@@ -250,8 +259,21 @@ def _fmp_build_df(inc, bal, cfs):
     total_debt = fmp_series_any(bal, ["totalDebt","totalDebtAndLeaseObligation"])
     cash       = fmp_series_any(bal, ["cashAndCashEquivalents","cashAndCashEquivalentsAtCarryingValue"])
 
-    cfo   = fmp_series_any(cfs, ["netCashProvidedByOperatingActivities","netCashProvidedByUsedInOperatingActivities"])
-    capex = fmp_series_any(cfs, ["capitalExpenditure","paymentsForProceedsFromPropertyPlantAndEquipment"])
+    # CFO & CapEx — expanded aliases (as-reported varies a lot)
+    cfo = fmp_series_any(cfs, [
+        "netCashProvidedByOperatingActivities",
+        "netCashProvidedByUsedInOperatingActivities",
+        "netCashProvidedByUsedInOperatingActivitiesContinuingOperations",
+        "netCashProvidedByUsedInOperatingActivitiesAndDiscontinuedOperations"
+    ])
+    capex = fmp_series_any(cfs, [
+        "capitalExpenditure",
+        "paymentsForProceedsFromPropertyPlantAndEquipment",
+        "paymentsToAcquirePropertyPlantAndEquipment",
+        "purchaseOfPropertyAndEquipment",
+        "purchaseOfPropertyPlantAndEquipment",
+        "capitalExpenditures",
+    ])
 
     years = sorted(set(revenue.index) | set(net_income.index) | set(diluted_eps.index) |
                    set(diluted_shares.index) | set(ebit.index) | set(tax_expense.index) |
@@ -270,13 +292,16 @@ def _fmp_build_df(inc, bal, cfs):
         A(x) for x in [revenue, net_income, diluted_eps, diluted_shares, ebit, tax_expense, pretax_income, equity, total_debt, cash, cfo, capex]
     ]
 
+    # EPS fallback if diluted missing
     eps = diluted_eps.copy()
     if eps.isna().all() and not net_income.isna().all() and not diluted_shares.isna().all():
         with np.errstate(invalid="ignore", divide="ignore"):
             eps = net_income / diluted_shares.replace({0: np.nan})
 
+    # Normalize CapEx (some feeds positive)
     capex = capex.apply(lambda v: abs(v) if not pd.isna(v) else v)
 
+    # FCF and ROIC
     fcf = (cfo - capex) if (not cfo.isna().all() and not capex.isna().all()) else pd.Series([np.nan]*len(years), index=years)
     with np.errstate(divide="ignore", invalid="ignore"):
         tax_rate = (tax_expense / pretax_income).clip(0, 1)
@@ -428,7 +453,7 @@ def get_price_alpha_vantage(symbol, apikey):
     except Exception:
         return np.nan
 
-# ---------- Common price helpers ----------
+# ---------- Price wrappers ----------
 def get_price_yahoo_safe(symbol): return get_price_yahoo(symbol)
 def get_price_fmp_safe(symbol):   return get_price_fmp(symbol, FMP_KEY) if FMP_KEY else np.nan
 def get_price_av_safe(symbol):    return get_price_alpha_vantage(symbol, AV_KEY) if AV_KEY else np.nan
@@ -504,8 +529,7 @@ if st.session_state.data is None:
 df, years, source, diag, current_price, chosen = st.session_state.data
 st.info(
     f"Provider: {source} · Years: {len(df.index)} · "
-    f"Has EPS: {df['EPS'].notna().sum()} · Has Revenue: {df['Revenue'].notna().sum()} · "
-    f"Has ROIC: {df['ROIC'].notna().sum()}"
+    f"Has EPS: {df['EPS'].notna().sum()} · Has FCF: {df['FCF'].notna().sum()} · Has ROIC: {df['ROIC'].notna().sum()}"
 )
 
 # =================== Tabs ===================
@@ -592,14 +616,13 @@ with tabs[2]:
 with tabs[3]:
     st.subheader("Intrinsic Value (Two Models)")
 
-    # Single MOS slider (already in form, but we read its value here live)
     mos_frac = st.session_state["mos_pct"] / 100.0
 
-    # --- Rule #1 EPS (Phil Town) ---
-    last_eps = df["EPS"].dropna().iloc[-1] if df["EPS"].notna().any() else np.nan
-    eps_hist_cagr  = series_cagr_gap(df["EPS"])
+    # --- Rule #1 EPS ---
+    eps_series = df["EPS"]
+    last_eps = latest_positive(eps_series, lookback=5)  # use latest positive EPS in last 5 data points
+    eps_hist_cagr = series_cagr_gap(eps_series)
 
-    # Analyst 5y EPS growth (Yahoo). We cache it to avoid churn; if it fails, ignore.
     @st.cache_data(show_spinner=False, ttl=3600)
     def get_analyst_eps_growth_5y(symbol):
         try:
@@ -619,21 +642,18 @@ with tabs[3]:
 
     analyst_growth = get_analyst_eps_growth_5y(st.session_state.last_query["ticker"])
 
-    # Growth used = lower of (user, hist, analyst), capped at 15%
+    # Growth used = lower of (user, hist, analyst) capped at 15%
     candidates = [g for g in [st.session_state["growth_eps_user"], eps_hist_cagr, analyst_growth] if not pd.isna(g) and g >= 0]
     rule1_growth = min(candidates) if candidates else np.nan
     if not pd.isna(rule1_growth): rule1_growth = min(rule1_growth, 0.15)
 
-    # Current price from the loaded fetch
-    current_price = current_price  # already fetched with the provider
-
+    # Current price already fetched
     current_pe = np.nan
     if not pd.isna(current_price) and not pd.isna(last_eps) and last_eps > 0:
         current_pe = current_price / last_eps
 
-    # Terminal P/E
     if st.session_state["auto_pe"] and not pd.isna(rule1_growth):
-        pe_from_growth = (rule1_growth * 100) * 2  # 2× growth%
+        pe_from_growth = (rule1_growth * 100) * 2
         choices = [pe_from_growth]
         if not pd.isna(current_pe) and current_pe > 0: choices.append(current_pe)
         term_pe = min(min(choices), 50.0)
@@ -651,10 +671,12 @@ with tabs[3]:
     fut_eps, sticker, fair_rule1 = rule1_eps_prices(last_eps, rule1_growth, st.session_state["years_eps"], term_pe, st.session_state["discount"])
     mos_price_rule1 = fair_rule1 * (1 - mos_frac) if not pd.isna(fair_rule1) else np.nan
 
-    # --- FCF‑DCF per share ---
-    shares_last = df["SharesDiluted"].dropna().iloc[-1] if df["SharesDiluted"].notna().any() else np.nan
-    fcf_last    = df["FCF"].dropna().iloc[-1] if df["FCF"].notna().any() else np.nan
-    fcf_ps_last = fcf_last / shares_last if (not pd.isna(fcf_last) and not pd.isna(shares_last) and shares_last > 0) else np.nan
+    # --- FCF-DCF per share ---
+    shares_series = df["SharesDiluted"]
+    fcf_series    = df["FCF"]
+    shares_last   = latest_positive(shares_series, lookback=5)
+    fcf_last      = latest_positive(fcf_series, lookback=5)
+    fcf_ps_last   = (fcf_last / shares_last) if (not pd.isna(fcf_last) and not pd.isna(shares_last) and shares_last > 0) else np.nan
 
     def intrinsic_dcf_fcf_per_share(fps_last, growth, years, terminal_g, discount):
         if pd.isna(fps_last) or fps_last <= 0: return np.nan
@@ -683,21 +705,27 @@ with tabs[3]:
     m1.metric(f"MOS Price (Rule #1, {int(st.session_state['mos_pct'])}%)", "—" if pd.isna(mos_price_rule1) else f"${mos_price_rule1:,.2f}")
     m2.metric(f"MOS Price (DCF, {int(st.session_state['mos_pct'])}%)",     "—" if pd.isna(mos_price_dcf)   else f"${mos_price_dcf:,.2f}")
 
+    # Friendly hints if an input is missing
+    if pd.isna(fair_rule1):
+        st.warning("Rule #1 fair value unavailable — check EPS last (must be > 0) and growth inputs. Try switching provider to FMP or Yahoo.")
+    if pd.isna(iv_dcf):
+        st.warning("DCF fair value unavailable — need positive FCF/share. Try switching provider or check CFO/CapEx fields.")
+
     with st.expander("Valuation inputs used"):
         st.write({
-            "EPS last": None if pd.isna(last_eps) else round(float(last_eps), 4),
+            "EPS last (latest positive in last 5)": None if pd.isna(last_eps) else round(float(last_eps), 4),
             "Rule #1 growth (used)": None if pd.isna(rule1_growth) else round(float(rule1_growth*100), 2),
             "Terminal P/E": None if pd.isna(term_pe) else round(float(term_pe), 2),
             "Future EPS (year N)": None if pd.isna(fut_eps) else round(float(fut_eps), 4),
             "Sticker (EPS × P/E at year N)": None if pd.isna(sticker) else round(float(sticker), 2),
             "Fair (sticker discounted @ MARR)": None if pd.isna(fair_rule1) else round(float(fair_rule1), 2),
-            "FCF/share last": None if pd.isna(fcf_ps_last) else round(float(fcf_ps_last), 4),
+            "FCF/share last (latest positive in last 5)": None if pd.isna(fcf_ps_last) else round(float(fcf_ps_last), 4),
             "DCF years": st.session_state["years_dcf"],
             "DCF growth %": round(float(st.session_state["growth_fcf"]*100), 2),
             "Terminal growth %": round(float(st.session_state["terminal_g"]*100), 2),
             "Discount (MARR) %": round(float(st.session_state["discount"]*100), 2),
         })
-    st.caption("MOS slider applies equally to both fair values. For ADBE, with reasonable settings (e.g., 10% MARR, growths within history and ≤15%), Rule #1 fair value can land ~in the mid‑$500s.")
+    st.caption("MOS slider applies equally to both fair values. With reasonable ADBE settings (10% MARR, growth ≤15%, Auto P/E), Rule #1 fair value often lands around the mid-$500s.")
 
 # -------- Diagnostics --------
 with tabs[4]:
@@ -706,4 +734,4 @@ with tabs[4]:
     st.json(diag)
     with st.expander("Raw data"):
         st.dataframe(df, use_container_width=True)
-    st.caption("If EPS is missing on one provider, try Auto mode or switch providers. Fiscal calendars and labels vary.")
+    st.caption("If EPS/FCF are missing on one provider, try Auto mode or switch providers. Fiscal calendars and labels vary.")
