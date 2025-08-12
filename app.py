@@ -611,18 +611,45 @@ with tabs[2]:
     for col in ["10yr","First 5yr","Last 3yr","Last 1yr"]:
         bdf[col] = bdf[col].apply(lambda x: "—" if pd.isna(x) else f"{x*100:.1f}%")
     st.dataframe(bdf, use_container_width=True, height=260)
-
 # -------- Valuation (two models + one MOS slider) --------
 with tabs[3]:
     st.subheader("Intrinsic Value (Two Models)")
 
     mos_frac = st.session_state["mos_pct"] / 100.0
 
-    # --- Rule #1 EPS ---
-    eps_series = df["EPS"]
-    last_eps = latest_positive(eps_series, lookback=5)  # use latest positive EPS in last 5 data points
+    # ---------- Sanity helpers ----------
+    def latest_positive(series, lookback=10):
+        s = series.dropna()
+        if lookback: s = s.iloc[-lookback:]
+        s = s[s > 0]
+        return s.iloc[-1] if len(s) else np.nan
+
+    # ---------- Build robust inputs ----------
+    eps_series = df["EPS"].astype(float)
+    # Fallback EPS = Net income / Diluted shares if EPS series missing/bad
+    if eps_series.dropna().le(0).all():
+        ni = df.get("Revenue")  # just to create a var; replaced right away below
+    net_income = df.get("NetIncome") if "NetIncome" in df.columns else None
+    if net_income is None or net_income.dropna().empty:
+        # try to reconstruct NetIncome from EPS * Shares if we have them both positive
+        shares_for_eps = df["SharesDiluted"]
+        if shares_for_eps.notna().any() and eps_series.notna().any():
+            net_income = eps_series * shares_for_eps
+        else:
+            net_income = pd.Series(dtype="float64")
+
+    # if original EPS is poor, rebuild from NI / Shares
+    if eps_series.dropna().le(0).all():
+        shares_eps = df["SharesDiluted"].replace({0: np.nan})
+        if shares_eps.notna().any() and (not net_income.dropna().empty):
+            with np.errstate(invalid="ignore", divide="ignore"):
+                eps_series = net_income / shares_eps
+
+    # Take latest positive over a wider window
+    last_eps = latest_positive(eps_series, lookback=10)
     eps_hist_cagr = series_cagr_gap(eps_series)
 
+    # Analyst 5y EPS growth (best-effort; ignore if it fails)
     @st.cache_data(show_spinner=False, ttl=3600)
     def get_analyst_eps_growth_5y(symbol):
         try:
@@ -642,20 +669,21 @@ with tabs[3]:
 
     analyst_growth = get_analyst_eps_growth_5y(st.session_state.last_query["ticker"])
 
-    # Growth used = lower of (user, hist, analyst) capped at 15%
-    candidates = [g for g in [st.session_state["growth_eps_user"], eps_hist_cagr, analyst_growth] if not pd.isna(g) and g >= 0]
+    # Growth used = min(user, 10y EPS CAGR, analyst), capped at 15%
+    candidates = [g for g in [st.session_state["growth_eps_user"], eps_hist_cagr, analyst_growth] if pd.notna(g) and g >= 0]
     rule1_growth = min(candidates) if candidates else np.nan
-    if not pd.isna(rule1_growth): rule1_growth = min(rule1_growth, 0.15)
+    if pd.notna(rule1_growth): rule1_growth = min(rule1_growth, 0.15)
 
-    # Current price already fetched
+    # Current P/E (if possible)
     current_pe = np.nan
-    if not pd.isna(current_price) and not pd.isna(last_eps) and last_eps > 0:
+    if pd.notna(current_price) and pd.notna(last_eps) and last_eps > 0:
         current_pe = current_price / last_eps
 
-    if st.session_state["auto_pe"] and not pd.isna(rule1_growth):
-        pe_from_growth = (rule1_growth * 100) * 2
+    # Terminal P/E
+    if st.session_state["auto_pe"] and pd.notna(rule1_growth):
+        pe_from_growth = (rule1_growth * 100) * 2  # 2× growth%
         choices = [pe_from_growth]
-        if not pd.isna(current_pe) and current_pe > 0: choices.append(current_pe)
+        if pd.notna(current_pe) and current_pe > 0: choices.append(current_pe)
         term_pe = min(min(choices), 50.0)
     else:
         term_pe = st.session_state["terminal_pe_man"]
@@ -669,14 +697,13 @@ with tabs[3]:
         return fut_eps, sticker, fair
 
     fut_eps, sticker, fair_rule1 = rule1_eps_prices(last_eps, rule1_growth, st.session_state["years_eps"], term_pe, st.session_state["discount"])
-    mos_price_rule1 = fair_rule1 * (1 - mos_frac) if not pd.isna(fair_rule1) else np.nan
+    mos_price_rule1 = fair_rule1 * (1 - mos_frac) if pd.notna(fair_rule1) else np.nan
 
-    # --- FCF-DCF per share ---
-    shares_series = df["SharesDiluted"]
-    fcf_series    = df["FCF"]
-    shares_last   = latest_positive(shares_series, lookback=5)
-    fcf_last      = latest_positive(fcf_series, lookback=5)
-    fcf_ps_last   = (fcf_last / shares_last) if (not pd.isna(fcf_last) and not pd.isna(shares_last) and shares_last > 0) else np.nan
+    # ---------- DCF (per share) ----------
+    shares_last = latest_positive(df["SharesDiluted"], lookback=10)
+    # FCF already computed: CFO - |CapEx| ; take latest positive
+    fcf_last    = latest_positive(df["FCF"], lookback=10)
+    fcf_ps_last = (fcf_last / shares_last) if (pd.notna(fcf_last) and pd.notna(shares_last) and shares_last > 0) else np.nan
 
     def intrinsic_dcf_fcf_per_share(fps_last, growth, years, terminal_g, discount):
         if pd.isna(fps_last) or fps_last <= 0: return np.nan
@@ -684,18 +711,18 @@ with tabs[3]:
         pv = 0.0
         f = fps_last
         for t in range(1, years + 1):
-            f *= (1 + growth)                 # grow next year's FCF/share
-            pv += f / ((1 + discount) ** t)   # discount to present
-        f_next = f * (1 + terminal_g)         # FCF in year N+1
-        tv = f_next / (discount - terminal_g) # Gordon terminal value at year N
-        pv += tv / ((1 + discount) ** years)  # discount terminal back to today
+            f *= (1 + growth)
+            pv += f / ((1 + discount) ** t)
+        f_next = f * (1 + terminal_g)
+        tv = f_next / (discount - terminal_g)
+        pv += tv / ((1 + discount) ** years)
         return pv
 
     iv_dcf  = intrinsic_dcf_fcf_per_share(fcf_ps_last, st.session_state["growth_fcf"],
                                           st.session_state["years_dcf"], st.session_state["terminal_g"], st.session_state["discount"])
-    mos_price_dcf = iv_dcf * (1 - mos_frac) if not pd.isna(iv_dcf) else np.nan
+    mos_price_dcf = iv_dcf * (1 - mos_frac) if pd.notna(iv_dcf) else np.nan
 
-    # --- Display ---
+    # ---------- Display ----------
     k1, k2, k3 = st.columns(3)
     k1.metric("Rule #1 Fair Value / share", "—" if pd.isna(fair_rule1) else f"${fair_rule1:,.2f}")
     k2.metric("DCF Fair Value / share",     "—" if pd.isna(iv_dcf)     else f"${iv_dcf:,.2f}")
@@ -705,33 +732,25 @@ with tabs[3]:
     m1.metric(f"MOS Price (Rule #1, {int(st.session_state['mos_pct'])}%)", "—" if pd.isna(mos_price_rule1) else f"${mos_price_rule1:,.2f}")
     m2.metric(f"MOS Price (DCF, {int(st.session_state['mos_pct'])}%)",     "—" if pd.isna(mos_price_dcf)   else f"${mos_price_dcf:,.2f}")
 
+    # ---------- Data sanity panel ----------
+    with st.expander("Data sanity (inputs feeding the two models)"):
+        st.write({
+            "EPS series non-missing": int(df["EPS"].notna().sum()),
+            "EPS last (latest positive in last 10)": None if pd.isna(last_eps) else round(float(last_eps), 4),
+            "EPS 10y CAGR": None if pd.isna(eps_hist_cagr) else round(float(eps_hist_cagr*100), 2),
+            "Analyst 5y EPS growth": None if pd.isna(analyst_growth) else round(float(analyst_growth*100), 2),
+            "Terminal P/E used": None if pd.isna(term_pe) else round(float(term_pe), 2),
+
+            "FCF series non-missing": int(df["FCF"].notna().sum()),
+            "Shares (diluted) non-missing": int(df["SharesDiluted"].notna().sum()),
+            "FCF last (latest positive in last 10)": None if pd.isna(fcf_last) else round(float(fcf_last), 2),
+            "Shares last (latest positive in last 10)": None if pd.isna(shares_last) else round(float(shares_last), 2),
+            "FCF/share last": None if pd.isna(fcf_ps_last) else round(float(fcf_ps_last), 4),
+        })
+
     # Friendly hints if an input is missing
     if pd.isna(fair_rule1):
-        st.warning("Rule #1 fair value unavailable — check EPS last (must be > 0) and growth inputs. Try switching provider to FMP or Yahoo.")
+        st.warning("Rule #1 fair value unavailable — need positive EPS. Try switching provider (Auto/FMP) or check Diagnostics.")
     if pd.isna(iv_dcf):
-        st.warning("DCF fair value unavailable — need positive FCF/share. Try switching provider or check CFO/CapEx fields.")
+        st.warning("DCF fair value unavailable — need positive FCF/share. Try switching provider (Auto/FMP) or check Diagnostics.")
 
-    with st.expander("Valuation inputs used"):
-        st.write({
-            "EPS last (latest positive in last 5)": None if pd.isna(last_eps) else round(float(last_eps), 4),
-            "Rule #1 growth (used)": None if pd.isna(rule1_growth) else round(float(rule1_growth*100), 2),
-            "Terminal P/E": None if pd.isna(term_pe) else round(float(term_pe), 2),
-            "Future EPS (year N)": None if pd.isna(fut_eps) else round(float(fut_eps), 4),
-            "Sticker (EPS × P/E at year N)": None if pd.isna(sticker) else round(float(sticker), 2),
-            "Fair (sticker discounted @ MARR)": None if pd.isna(fair_rule1) else round(float(fair_rule1), 2),
-            "FCF/share last (latest positive in last 5)": None if pd.isna(fcf_ps_last) else round(float(fcf_ps_last), 4),
-            "DCF years": st.session_state["years_dcf"],
-            "DCF growth %": round(float(st.session_state["growth_fcf"]*100), 2),
-            "Terminal growth %": round(float(st.session_state["terminal_g"]*100), 2),
-            "Discount (MARR) %": round(float(st.session_state["discount"]*100), 2),
-        })
-    st.caption("MOS slider applies equally to both fair values. With reasonable ADBE settings (10% MARR, growth ≤15%, Auto P/E), Rule #1 fair value often lands around the mid-$500s.")
-
-# -------- Diagnostics --------
-with tabs[4]:
-    st.subheader("Data Diagnostics")
-    st.write("Non-missing values per series (higher is better):")
-    st.json(diag)
-    with st.expander("Raw data"):
-        st.dataframe(df, use_container_width=True)
-    st.caption("If EPS/FCF are missing on one provider, try Auto mode or switch providers. Fiscal calendars and labels vary.")
