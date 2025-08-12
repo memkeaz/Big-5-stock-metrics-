@@ -4,63 +4,61 @@ import numpy as np
 import requests
 
 # =================== Page ===================
-st.set_page_config(page_title="Phil Town Big 5 Screener", layout="wide")
-st.title("Phil Town Big 5 — 10-Year Screener")
-st.caption("Big 5 (Sales, EPS, Equity, FCF CAGR + 10-yr Avg ROIC), 10/5/3/1 breakdowns, Rule #1 EPS & FCF DCF valuations with live MOS sliders, and a Value-Investor summary.")
+st.set_page_config(
+    page_title="Phil Town Big 5 Screener",
+    layout="wide",
+    initial_sidebar_state="collapsed"
+)
+st.markdown(
+    """
+    <style>
+      /* Mobile-friendly paddings & tighter layout */
+      .block-container { padding-top: 1rem; padding-bottom: 3rem; max-width: 1100px; }
+      @media (max-width: 640px) {
+        .block-container { padding-left: 0.8rem; padding-right: 0.8rem; }
+        .stMetric { text-align: left; }
+      }
+      .fine { color: #777; font-size: 0.9rem; }
+    </style>
+    """,
+    unsafe_allow_html=True
+)
 
-# =================== Top controls ===================
-c1, c2 = st.columns([3,1])
-with c1:
-    st.info("If results don't show, click **Clear Cache** then search again.")
-with c2:
-    if st.button("Clear Cache"):
-        st.cache_data.clear()
-        st.success("Cache cleared. Run a new search.")
+# =================== Header ===================
+st.title("Phil Town Big 5 Screener")
+st.caption("Check the Big 5 (Sales, EPS, Equity, FCF CAGRs + 10‑yr Avg ROIC), view 10/5/3/1 trend breakdowns, and run Rule #1 EPS & FCF‑DCF valuations with adjustable MOS.")
 
-# =================== Sidebar ===================
-st.sidebar.header("Settings")
-provider = st.sidebar.radio("Data Provider", ["Alpha Vantage", "FMP"])
-ticker = st.text_input("Enter ticker (e.g., AAPL, MSFT, ADBE):", value="MSFT").strip().upper()
-run = st.button("Search")
-
-# Secrets (set these in Streamlit Cloud: ⋮ → Edit secrets)
+# =================== Secrets ===================
 OPENAI_KEY = st.secrets.get("OPENAI_API_KEY", "").strip()
-AV_KEY = st.secrets.get("ALPHAVANTAGE_API_KEY", "").strip()
-FMP_KEY = st.secrets.get("FMP_API_KEY", "").strip()
+AV_KEY     = st.secrets.get("ALPHAVANTAGE_API_KEY", "").strip()
+FMP_KEY    = st.secrets.get("FMP_API_KEY", "").strip()
 
-st.sidebar.markdown("### Valuation Assumptions")
-# Rule #1 EPS — app uses LOWER of (your estimate, 10y EPS CAGR, analyst 5y EPS growth), capped at 15%
-years_eps = 10  # Rule #1 standard
-growth_eps_user = st.sidebar.number_input("Your EPS growth estimate (annual, %)", 0.0, 50.0, 12.0, step=0.5) / 100.0
-auto_pe = st.sidebar.checkbox("Terminal P/E ≈ lower of (2× growth, current P/E), capped at 50", value=True)
-terminal_pe_manual = st.sidebar.number_input("Terminal P/E (manual if Auto off)", 5.0, 60.0, 20.0, step=0.5)
+# =================== Controls (single Search button) ===================
+with st.form("search"):
+    top1, top2 = st.columns([2, 1])
+    with top1:
+        ticker = st.text_input("Ticker", value="ADBE").strip().upper()
+    with top2:
+        provider = st.selectbox("Data source", ["FMP", "Alpha Vantage"], index=0)
+    adv = st.expander("Valuation Settings", expanded=False)
+    with adv:
+        st.markdown("**Rule #1 EPS (Phil Town)**")
+        years_eps        = st.slider("Years (EPS projection)", 5, 15, 10)
+        growth_eps_user  = st.number_input("Your EPS growth estimate (annual, %)", 0.0, 50.0, 12.0, step=0.5) / 100.0
+        auto_pe          = st.checkbox("Terminal P/E ≈ lower of (2× growth, current P/E), capped at 50", value=True)
+        terminal_pe_man  = st.number_input("Terminal P/E (manual if Auto off)", 5.0, 60.0, 20.0, step=0.5)
+        st.markdown("---")
+        st.markdown("**FCF DCF**")
+        years_dcf  = st.slider("Years (DCF)", 5, 15, 10)
+        growth_fcf = st.number_input("FCF growth (annual, %)", 0.0, 50.0, 10.0, step=0.5) / 100.0
+        terminal_g = st.number_input("Terminal growth (FCF, %)", 0.0, 6.0, 3.0, step=0.25) / 100.0
+        discount   = st.number_input("MARR / Discount rate (%, both models)", 4.0, 20.0, 10.0, step=0.5) / 100.0
+        st.markdown("---")
+        st.markdown("**Default Margin of Safety (%)**")
+        mos_eps_default = st.slider("Rule #1 EPS MOS", 0, 90, 50, step=5) / 100.0
+        mos_dcf_default = st.slider("FCF DCF MOS", 0, 90, 50, step=5) / 100.0
 
-# FCF DCF
-years_dcf = st.sidebar.slider("Years (FCF DCF)", 5, 15, 10)
-growth_fcf = st.sidebar.number_input("FCF growth (annual, %)", 0.0, 50.0, 10.0, step=0.5) / 100.0
-terminal_g = st.sidebar.number_input("Terminal growth (FCF, %)", 0.0, 6.0, 3.0, step=0.25) / 100.0
-
-# Discount (MARR)
-discount = st.sidebar.number_input("MARR / Discount rate (%, both models)", 4.0, 20.0, 10.0, step=0.5) / 100.0
-
-# Default MOS in sidebar (prefills live sliders)
-st.sidebar.markdown("### Default MOS (prefill for live sliders)")
-mos_eps_pct_default = st.sidebar.slider("Default MOS for Rule #1 EPS (%)", 0, 90, 50, step=5) / 100.0
-mos_dcf_pct_default = st.sidebar.slider("Default MOS for FCF DCF (%)", 0, 90, 50, step=5) / 100.0
-
-# =================== Demo ===================
-def demo_msft_df():
-    years = list(range(2015, 2025))
-    shares = [7900, 7800, 7750, 7720, 7700, 7680, 7650, 7450, 7420, 7400]  # millions (demo)
-    df = pd.DataFrame({
-        "Revenue": [93580, 85320, 89950, 110360, 125843, 143015, 168088, 198270, 211915, 245000],
-        "EPS":     [2.48, 2.79, 3.31, 2.13, 5.76, 6.20, 8.05, 9.21, 9.68, 11.00],
-        "Equity":  [72163, 82718, 82572, 82572, 118304, 118304, 166542, 166542, 194000, 210000],
-        "FCF":     [23969, 31378, 31922, 32694, 45230, 45300, 56300, 65700, 67800, 78000],
-        "ROIC":    [0.12, 0.13, 0.15, 0.10, 0.18, 0.19, 0.21, 0.22, 0.20, 0.21],
-        "SharesDiluted": shares
-    }, index=years).astype(float)
-    return df.iloc[-10:], years[-10:]
+    go = st.form_submit_button("Search")
 
 # =================== Helpers ===================
 def cagr_over_years(first_val, last_val, first_year, last_year):
@@ -84,48 +82,42 @@ def yoy(series: pd.Series) -> float:
     if prev <= 0 or pd.isna(prev) or pd.isna(last): return np.nan
     return (last / prev) - 1
 
-def pct(x: float) -> str:
-    return "—" if (x is None or pd.isna(x)) else f"{x*100:.1f}%"
-
 def safe_mean(s: pd.Series) -> float:
     s = s.replace([np.inf, -np.inf], np.nan).dropna()
     return s.mean() if len(s) else np.nan
 
-# =================== Data fetchers ===================
-AV_BASE = "https://www.alphavantage.co/query"
+def pct(x): return "—" if pd.isna(x) else f"{x*100:.1f}%"
+
+# =================== Fetchers ===================
+AV_BASE  = "https://www.alphavantage.co/query"
 FMP_BASE = "https://financialmodelingprep.com/api/v3"
 
-# -------------------- Alpha Vantage fetch (patched for accuracy) --------------------
+def _diag(df: pd.DataFrame):
+    return {k:int(v) for k,v in df.notna().sum().to_dict().items()}
+
+# ----- Alpha Vantage (patched) -----
 def av_get(fn: str, symbol: str, apikey: str):
-    params = {"function": fn, "symbol": symbol, "apikey": apikey}
-    r = requests.get(AV_BASE, params=params, timeout=30)
+    p = {"function": fn, "symbol": symbol, "apikey": apikey}
+    r = requests.get(AV_BASE, params=p, timeout=30)
     r.raise_for_status()
-    j = r.json()
-    return j.get("annualReports", [])
+    return r.json().get("annualReports", [])
 
 def av_series(reports, field) -> pd.Series:
-    """Return a numeric series by year for a single AV field (if present)."""
     if not reports: return pd.Series(dtype="float64")
     rows = []
     for rep in reports:
         y = pd.to_datetime(rep.get("fiscalDateEnding", ""), errors="coerce").year
         if pd.isna(y): continue
-        raw = rep.get(field, None)
-        val = pd.to_numeric(raw, errors="coerce")
-        rows.append((int(y), val))
+        rows.append((int(y), pd.to_numeric(rep.get(field), errors="coerce")))
     if not rows: return pd.Series(dtype="float64")
     s = pd.Series(dict(rows)).sort_index()
     return s.iloc[-11:].astype("float64")
 
 def av_series_sum(reports, fields) -> pd.Series:
-    """Sum multiple AV fields (useful for total debt = short + long)."""
     total = None
     for f in fields:
         s = av_series(reports, f)
-        if total is None:
-            total = s
-        else:
-            total = total.add(s, fill_value=0)
+        total = s if total is None else total.add(s, fill_value=0)
     return total if total is not None else pd.Series(dtype="float64")
 
 @st.cache_data(show_spinner=False, ttl=1800)
@@ -134,90 +126,61 @@ def fetch_alpha_vantage(symbol: str, apikey: str):
     bal = av_get("BALANCE_SHEET",  symbol, apikey)
     cfs = av_get("CASH_FLOW",      symbol, apikey)
 
-    # Income statement
     revenue        = av_series(inc, "totalRevenue")
     net_income     = av_series(inc, "netIncome")
     diluted_eps    = av_series(inc, "dilutedEPS")
     ebit           = av_series(inc, "ebit")
     tax_expense    = av_series(inc, "incomeTaxExpense")
     pretax_income  = av_series(inc, "incomeBeforeTax")
+    shares_diluted = av_series(bal, "commonStockSharesOutstanding")  # proxy
+    equity         = av_series(bal, "totalShareholderEquity")
 
-    # Shares (proxy): end-of-period shares from balance sheet
-    shares_diluted = av_series(bal, "commonStockSharesOutstanding")
-
-    # Balance sheet
-    equity = av_series(bal, "totalShareholderEquity")
-
-    # Debt: try multiple constructions to avoid gaps
     debt_primary   = av_series_sum(bal, ["shortTermDebt", "longTermDebt"])
     debt_alt       = av_series_sum(bal, ["currentLongTermDebt", "longTermDebtNoncurrent"])
-    debt_fallback1 = av_series(bal, "totalDebt")
-    debt_fallback2 = av_series(bal, "shortLongTermDebtTotal")
-    total_debt = debt_primary
-    if total_debt is None or total_debt.empty:
-        total_debt = debt_alt
-    if total_debt is None or total_debt.empty:
-        total_debt = debt_fallback1
-    if total_debt is None or total_debt.empty:
-        total_debt = debt_fallback2
+    debt_fb1       = av_series(bal, "totalDebt")
+    debt_fb2       = av_series(bal, "shortLongTermDebtTotal")
+    total_debt     = debt_primary if (not debt_primary.empty) else (debt_alt if not debt_alt.empty else (debt_fb1 if not debt_fb1.empty else debt_fb2))
 
-    # Cash variants
     cash = av_series(bal, "cashAndCashEquivalentsAtCarryingValue")
-    if cash.empty:
-        cash = av_series(bal, "cashAndCashEquivalents")
-    if cash.empty:
-        cash = av_series(bal, "cashAndShortTermInvestments")
+    if cash.empty: cash = av_series(bal, "cashAndCashEquivalents")
+    if cash.empty: cash = av_series(bal, "cashAndShortTermInvestments")
 
-    # Cash flow
     cfo   = av_series(cfs, "operatingCashflow")
     capex = av_series(cfs, "capitalExpenditures")
 
-    # Align years
-    years = sorted(
-        set(revenue.index) | set(net_income.index) | set(diluted_eps.index) |
-        set(shares_diluted.index) | set(ebit.index) | set(tax_expense.index) |
-        set(pretax_income.index) | set(equity.index) | set(total_debt.index) |
-        set(cash.index) | set(cfo.index) | set(capex.index)
-    )[-11:]
+    years = sorted(set(revenue.index) | set(net_income.index) | set(diluted_eps.index) |
+                   set(shares_diluted.index) | set(ebit.index) | set(tax_expense.index) |
+                   set(pretax_income.index) | set(equity.index) | set(total_debt.index) |
+                   set(cash.index) | set(cfo.index) | set(capex.index))[-11:]
 
     def A(s): return s.reindex(years).astype("float64") if years else pd.Series(dtype="float64")
-
     revenue, net_income, diluted_eps, shares_diluted, ebit, tax_expense, pretax_income, equity, total_debt, cash, cfo, capex = [
         A(x) for x in [revenue, net_income, diluted_eps, shares_diluted, ebit, tax_expense, pretax_income, equity, total_debt, cash, cfo, capex]
     ]
 
-    # EPS fallback if dilutedEPS missing
     eps = diluted_eps.copy()
     if eps.isna().all() and not net_income.isna().all() and not shares_diluted.isna().all():
         with np.errstate(invalid="ignore", divide="ignore"):
-            eps = net_income / shares_diluted.replace({0: np.nan})
+            eps = net_income / shares_diluted.replace({0: np.nan})  # fallback, not perfect
 
-    # FCF = CFO − CapEx (CapEx often negative on AV; subtraction handles sign)
-    if not cfo.isna().all() and not capex.isna().all():
-        fcf = (cfo - capex)
-    else:
-        fcf = pd.Series([np.nan]*len(years), index=years)
+    fcf = (cfo - capex) if (not cfo.isna().all() and not capex.isna().all()) else pd.Series([np.nan]*len(years), index=years)
 
-    # ROIC = NOPAT / (Debt + Equity − Cash)
     with np.errstate(divide="ignore", invalid="ignore"):
         tax_rate = (tax_expense / pretax_income).clip(0, 1)
     nopat = (ebit * (1 - tax_rate.fillna(0.21))) if not ebit.isna().all() else net_income
-    invested_capital = (total_debt.fillna(0) + equity.fillna(0) - cash.fillna(0)).replace({0: np.nan})
+    invested_capital = (total_debt.fillna(0) + equity.fillna(0) - cash.fillna(0))
+    invested_capital = invested_capital.replace({0: np.nan})  # avoid division blowups
     with np.errstate(divide="ignore", invalid="ignore"):
         roic = (nopat / invested_capital).replace([np.inf, -np.inf], np.nan)
 
     df = pd.DataFrame({
-        "Revenue": revenue,
-        "EPS": eps,
-        "Equity": equity,
-        "FCF": fcf,
-        "ROIC": roic,
-        "SharesDiluted": shares_diluted
+        "Revenue": revenue, "EPS": eps, "Equity": equity, "FCF": fcf, "ROIC": roic, "SharesDiluted": shares_diluted
     }).sort_index().tail(11)
 
-    return df, years, "Alpha Vantage (patched)"
+    diag = _diag(df)
+    return df, years, "Alpha Vantage (patched)", diag
 
-# -------------------- FMP fetch --------------------
+# ----- FMP (recommended for EPS accuracy) -----
 def fmp_get(path: str, apikey: str, params=None):
     if params is None: params = {}
     params["apikey"] = apikey
@@ -231,10 +194,9 @@ def fmp_series(reports, field) -> pd.Series:
     for rep in reports:
         y = pd.to_datetime(rep.get("date") or rep.get("calendarYear"), errors="coerce").year
         if pd.isna(y):
-            try: y = int(rep.get("calendarYear"))
+            try: y = int(rep.get("calendarYear")); 
             except: continue
-        val = pd.to_numeric(rep.get(field, None), errors="coerce")
-        rows.append((int(y), val))
+        rows.append((int(y), pd.to_numeric(rep.get(field), errors="coerce")))
     if not rows: return pd.Series(dtype="float64")
     s = pd.Series(dict(rows)).sort_index()
     return s.iloc[-11:].astype("float64")
@@ -287,28 +249,30 @@ def fetch_fmp(symbol: str, apikey: str):
     df = pd.DataFrame({
         "Revenue": revenue, "EPS": eps, "Equity": equity, "FCF": fcf, "ROIC": roic, "SharesDiluted": diluted_shares
     }).sort_index().tail(11)
-    return df, years, "FMP"
 
-# -------------------- Current price --------------------
+    diag = _diag(df)
+    return df, years, "FMP", diag
+
+# =================== Price & Analyst growth ===================
 def get_price_alpha_vantage(symbol: str, apikey: str) -> float:
     try:
-        url = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={symbol}&apikey={apikey}"
-        j = requests.get(url, timeout=30).json()
+        j = requests.get(
+            f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={symbol}&apikey={apikey}",
+            timeout=30
+        ).json()
         return float(j.get("Global Quote", {}).get("05. price", "nan"))
     except Exception:
         return np.nan
 
 def get_price_fmp(symbol: str, apikey: str) -> float:
     try:
-        url = f"{FMP_BASE}/quote-short/{symbol}?apikey={apikey}"
-        j = requests.get(url, timeout=30).json()
+        j = requests.get(f"{FMP_BASE}/quote-short/{symbol}?apikey={apikey}", timeout=30).json()
         if isinstance(j, list) and j:
             return float(j[0].get("price", "nan"))
         return np.nan
     except Exception:
         return np.nan
 
-# -------------------- Analyst 5y EPS growth (Yahoo Finance) --------------------
 @st.cache_data(show_spinner=False, ttl=3600)
 def get_analyst_eps_growth_5y(symbol: str) -> float:
     try:
@@ -318,9 +282,8 @@ def get_analyst_eps_growth_5y(symbol: str) -> float:
         trend = j["quoteSummary"]["result"][0]["earningsTrend"]["trend"]
         for t in trend:
             if t.get("period") in ("+5y", "5y"):
-                val = t.get("growth", {}).get("raw")
-                if val is not None:
-                    return float(val)  # decimal (e.g., 0.12)
+                raw = t.get("growth", {}).get("raw")
+                if raw is not None: return float(raw)
         lt = j["quoteSummary"]["result"][0]["earningsTrend"].get("longTermEpsGrowthRate", {})
         if "raw" in lt and lt["raw"] is not None:
             return float(lt["raw"])
@@ -328,7 +291,6 @@ def get_analyst_eps_growth_5y(symbol: str) -> float:
         pass
     return np.nan
 
-# =================== Intrinsic value (FCF DCF) ===================
 def intrinsic_dcf_fcf(fps_last: float, growth: float, years: int, terminal_g: float, discount: float) -> float:
     if pd.isna(fps_last) or fps_last <= 0: return np.nan
     if discount <= terminal_g: return np.nan
@@ -343,264 +305,212 @@ def intrinsic_dcf_fcf(fps_last: float, growth: float, years: int, terminal_g: fl
     return pv
 
 # =================== Run ===================
-if run:
-    using_av = (provider == "Alpha Vantage")
-    key_ok = (AV_KEY if using_av else FMP_KEY)
-    st.info(f"Provider: **{provider}** · API key set: **{'Yes' if key_ok else 'No'}** · Ticker: **{ticker}**")
+if go:
+    using_av  = (provider == "Alpha Vantage")
+    have_key  = (AV_KEY if using_av else FMP_KEY)
+    if not have_key:
+        st.error("Missing API key in Streamlit Secrets for the selected provider.")
+        st.stop()
 
-    if not key_ok:
-        st.error("Missing API key in Streamlit Secrets.")
-        df, years = demo_msft_df()
-        source = "Demo (sample)"
-        current_price = np.nan
-    else:
-        try:
-            if using_av:
-                df, years, source = fetch_alpha_vantage(ticker, AV_KEY)
-                current_price = get_price_alpha_vantage(ticker, AV_KEY)
-            else:
-                df, years, source = fetch_fmp(ticker, FMP_KEY)
-                current_price = get_price_fmp(ticker, FMP_KEY)
-            if df.empty:
-                st.warning("No data returned — switching to Demo Mode.")
-                df, years = demo_msft_df()
-                source = "Demo (sample)"
-                current_price = np.nan
-        except Exception as e:
-            st.error(f"Error: {e}")
-            df, years = demo_msft_df()
-            source = "Demo (sample)"
-            current_price = np.nan
+    # Fetch
+    try:
+        if using_av:
+            df, years, source, diag = fetch_alpha_vantage(ticker, AV_KEY)
+            current_price = get_price_alpha_vantage(ticker, AV_KEY)
+            st.caption("Using Alpha Vantage — if EPS/ROIC looks off for ADBE, try **FMP**.")
+        else:
+            df, years, source, diag = fetch_fmp(ticker, FMP_KEY)
+            current_price = get_price_fmp(ticker, FMP_KEY)
+    except Exception as e:
+        st.error(f"Fetch error: {e}")
+        st.stop()
 
-    # ---------- Big 5 (10-year) ----------
-    def series_cagr_gap(s: pd.Series) -> float:
-        y = s.dropna()
-        if len(y) < 2: return np.nan
-        return cagr_over_years(y.iloc[0], y.iloc[-1], int(y.index[0]), int(y.index[-1]))
+    if df.empty or len(df.index) < 3:
+        st.warning("Not enough data returned. Try switching the provider.")
+        st.json(diag)
+        st.stop()
 
-    sales_cagr_10 = series_cagr_gap(df["Revenue"])
-    eps_cagr_10   = series_cagr_gap(df["EPS"])
-    eqty_cagr_10  = series_cagr_gap(df["Equity"])
-    fcf_cagr_10   = series_cagr_gap(df["FCF"])
-    roic_avg_10   = safe_mean(df["ROIC"])
+    # =================== SECTIONS ===================
+    tabs = st.tabs(["Overview", "Big 5", "Breakdowns", "Valuation", "Summary (AI)", "Diagnostics"])
 
-    def pf(v): return "PASS ✅" if not pd.isna(v) and v >= 0.10 else ("—" if pd.isna(v) else "FAIL ❌")
-    def fmt(x): return "—" if pd.isna(x) else f"{x*100:.1f}%"
+    # -------- Overview --------
+    with tabs[0]:
+        st.subheader(f"{ticker} · Source: {source}")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Years loaded", f"{len(df.index)}")
+        c2.metric("Current Price", "—" if pd.isna(current_price) else f"${current_price:,.2f}")
+        c3.metric("Latest EPS", "—" if df['EPS'].dropna().empty else f"{df['EPS'].dropna().iloc[-1]:.2f}")
+        c4.metric("Latest ROIC", "—" if df['ROIC'].dropna().empty else pct(df['ROIC'].dropna().iloc[-1]))
+        st.markdown('<span class="fine">Tip: If ADBE looks wrong on Alpha Vantage, switch to FMP (more reliable EPS).</span>', unsafe_allow_html=True)
+        with st.expander("Quick charts"):
+            cc1, cc2, cc3 = st.columns(3)
+            cc1.line_chart(df[["Revenue","FCF"]].dropna(), height=200, use_container_width=True)
+            cc2.line_chart(df[["EPS"]].dropna(), height=200, use_container_width=True)
+            cc3.line_chart(df[["ROIC"]].dropna(), height=200, use_container_width=True)
 
-    big5 = pd.DataFrame({
-        "Metric": ["Sales (Revenue) CAGR","EPS CAGR","Equity CAGR","FCF CAGR","ROIC (10-yr Avg)"],
-        "Value (10y)":  [fmt(sales_cagr_10), fmt(eps_cagr_10), fmt(eqty_cagr_10), fmt(fcf_cagr_10), fmt(roic_avg_10)],
-        "Pass ≥10%?": [pf(sales_cagr_10), pf(eps_cagr_10), pf(eqty_cagr_10), pf(fcf_cagr_10), pf(roic_avg_10)]
-    })
+    # -------- Big 5 --------
+    with tabs[1]:
+        st.subheader("Big 5 — 10‑Year Check")
+        sales_cagr_10 = series_cagr_gap(df["Revenue"])
+        eps_cagr_10   = series_cagr_gap(df["EPS"])
+        eqty_cagr_10  = series_cagr_gap(df["Equity"])
+        fcf_cagr_10   = series_cagr_gap(df["FCF"])
+        roic_avg_10   = safe_mean(df["ROIC"])
+        def pf(v): return "PASS ✅" if not pd.isna(v) and v >= 0.10 else ("—" if pd.isna(v) else "FAIL ❌")
+        big5 = pd.DataFrame({
+            "Metric": ["Sales (Revenue) CAGR","EPS CAGR","Equity CAGR","FCF CAGR","ROIC (10‑yr Avg)"],
+            "Value (10y)":  [pct(sales_cagr_10), pct(eps_cagr_10), pct(eqty_cagr_10), pct(fcf_cagr_10), pct(roic_avg_10)],
+            "Pass ≥10%?": [pf(sales_cagr_10), pf(eps_cagr_10), pf(eqty_cagr_10), pf(fcf_cagr_10), pf(roic_avg_10)]
+        })
+        st.dataframe(big5, use_container_width=True, height=240)
 
-    st.subheader(f"Big 5 — 10-Year Check · {ticker}  ·  Source: {source}")
-    st.dataframe(big5, use_container_width=True)
+    # -------- Breakdowns --------
+    with tabs[2]:
+        st.subheader("Trends: 10 / First‑5 / Last‑3 / Last‑1")
+        def breakdown_growth(s: pd.Series):
+            s = s.dropna()
+            if len(s) < 2: return np.nan, np.nan, np.nan, np.nan
+            ten = series_cagr_gap(s)
+            first5 = cagr_over_years(s.iloc[0], s.iloc[min(4, len(s)-1)], int(s.index[0]), int(s.index[min(4, len(s)-1]))) if len(s) >= 5 else np.nan
+            last3  = cagr_over_years(s.iloc[-4], s.iloc[-1], int(s.index[-4]), int(s.index[-1])) if len(s) >= 4 else np.nan
+            last1  = yoy(s)
+            return ten, first5, last3, last1
 
-    # ---------- Metric Breakdown (10 / First-5 / Last-3 / Last-1) ----------
-    def breakdown_growth(s: pd.Series):
-        s = s.dropna()
-        if len(s) < 2:
-            return np.nan, np.nan, np.nan, np.nan
-        ten = series_cagr_gap(s)
-        first5 = np.nan
-        if len(s) >= 5:
-            window = s.iloc[:5]
-            first5 = cagr_over_years(window.iloc[0], window.iloc[-1], int(window.index[0]), int(window.index[-1]))
-        last3 = np.nan
-        if len(s) >= 4:
-            w = s.iloc[-4:]
-            last3 = cagr_over_years(w.iloc[0], w.iloc[-1], int(w.index[0]), int(w.index[-1]))
-        last1 = yoy(s)
-        return ten, first5, last3, last1
+        def breakdown_roic(s: pd.Series):
+            s = s.replace([np.inf, -np.inf], np.nan).dropna()
+            if len(s)==0: return np.nan, np.nan, np.nan, np.nan
+            ten    = safe_mean(s)
+            first5 = safe_mean(s.iloc[:5]) if len(s)>=5 else np.nan
+            last3  = safe_mean(s.iloc[-3:]) if len(s)>=3 else np.nan
+            last1  = s.iloc[-1]
+            return ten, first5, last3, last1
 
-    def breakdown_roic(s: pd.Series):
-        s = s.replace([np.inf, -np.inf], np.nan).dropna()
-        if len(s) == 0:
-            return np.nan, np.nan, np.nan, np.nan
-        ten = safe_mean(s)
-        first5 = safe_mean(s.iloc[:5]) if len(s) >= 5 else np.nan
-        last3 = safe_mean(s.iloc[-3:]) if len(s) >= 1 else np.nan
-        last1 = s.iloc[-1]
-        return ten, first5, last3, last1
+        metrics = {
+            "Sales CAGR": breakdown_growth(df["Revenue"]),
+            "EPS CAGR":   breakdown_growth(df["EPS"]),
+            "Equity CAGR":breakdown_growth(df["Equity"]),
+            "FCF CAGR":   breakdown_growth(df["FCF"]),
+            "ROIC":       breakdown_roic(df["ROIC"]),
+        }
+        bdf = pd.DataFrame(
+            [(k,)+v for k,v in metrics.items()],
+            columns=["Metric","10yr","First 5yr","Last 3yr","Last 1yr"]
+        )
+        for col in ["10yr","First 5yr","Last 3yr","Last 1yr"]:
+            bdf[col] = bdf[col].apply(lambda x: "—" if pd.isna(x) else f"{x*100:.1f}%")
+        st.dataframe(bdf, use_container_width=True, height=260)
 
-    sales_b = breakdown_growth(df["Revenue"])
-    eps_b   = breakdown_growth(df["EPS"])
-    eqty_b  = breakdown_growth(df["Equity"])
-    fcf_b   = breakdown_growth(df["FCF"])
-    roic_b  = breakdown_roic(df["ROIC"])
+    # -------- Valuation --------
+    with tabs[3]:
+        st.subheader("Intrinsic Value")
+        # Live MOS sliders (mobile-friendly in-row)
+        m1, m2 = st.columns(2)
+        with m1: mos_eps_live = st.slider("MOS — Rule #1 EPS", 0, 90, int(mos_eps_default*100), step=5) / 100.0
+        with m2: mos_dcf_live = st.slider("MOS — FCF DCF",   0, 90, int(mos_dcf_default*100), step=5) / 100.0
 
-    breakdown_df = pd.DataFrame({
-        "Metric": ["Sales CAGR","EPS CAGR","Equity CAGR","FCF CAGR","ROIC"],
-        "10yr":   [sales_b[0], eps_b[0], eqty_b[0], fcf_b[0], roic_b[0]],
-        "First 5yr": [sales_b[1], eps_b[1], eqty_b[1], fcf_b[1], roic_b[1]],
-        "Last 3yr":  [sales_b[2], eps_b[2], eqty_b[2], fcf_b[2], roic_b[2]],
-        "Last 1yr":  [sales_b[3], eps_b[3], eqty_b[3], fcf_b[3], roic_b[3]],
-    })
+        last_eps = df["EPS"].dropna().iloc[-1] if df["EPS"].notna().any() else np.nan
+        analyst_growth = get_analyst_eps_growth_5y(ticker)  # decimal, may be NaN
+        eps_hist_cagr  = series_cagr_gap(df["EPS"])
 
-    breakdown_fmt = breakdown_df.copy()
-    for col in ["10yr","First 5yr","Last 3yr","Last 1yr"]:
-        breakdown_fmt[col] = breakdown_fmt[col].apply(lambda v: "—" if pd.isna(v) else f"{v*100:.1f}%")
+        # Rule #1 growth used = lower of (user, hist, analyst), capped at 15%
+        candidates = [g for g in [growth_fcf*0 + growth_eps_user, eps_hist_cagr, analyst_growth] if not pd.isna(g) and g >= 0]
+        rule1_growth = min(candidates) if candidates else np.nan
+        if not pd.isna(rule1_growth): rule1_growth = min(rule1_growth, 0.15)
 
-    st.markdown("### Metric Breakdown (10 / First-5 / Last-3 / Last-1)")
-    st.dataframe(breakdown_fmt, use_container_width=True)
+        # Current price
+        current_price = (get_price_alpha_vantage(ticker, AV_KEY) if using_av else get_price_fmp(ticker, FMP_KEY))
 
-    # ---------- Data Coverage ----------
-    st.markdown("#### Data Coverage (non-missing values used)")
-    coverage = df.notna().sum().rename("Valid Years").to_frame()
-    coverage["Out of"] = len(df.index)
-    st.dataframe(coverage.T, use_container_width=True)
+        current_pe = np.nan
+        if not pd.isna(current_price) and not pd.isna(last_eps) and last_eps > 0:
+            current_pe = current_price / last_eps
 
-    # ---------- Intrinsic Value ----------
-    st.markdown("### Intrinsic Value")
+        # Terminal P/E
+        if auto_pe and not pd.isna(rule1_growth):
+            pe_from_growth = (rule1_growth * 100) * 2
+            choices = [pe_from_growth]
+            if not pd.isna(current_pe) and current_pe > 0: choices.append(current_pe)
+            term_pe = min(min(choices), 50.0)
+        else:
+            term_pe = terminal_pe_man
 
-    # Live MOS sliders (override the sidebar defaults)
-    mos_cols = st.columns(2)
-    with mos_cols[0]:
-        mos_eps_live = st.slider("Adjust MOS for Rule #1 EPS (%)", 0, 90, int(mos_eps_pct_default * 100), step=5, key="mos_eps_live") / 100.0
-    with mos_cols[1]:
-        mos_dcf_live = st.slider("Adjust MOS for FCF DCF (%)", 0, 90, int(mos_dcf_pct_default * 100), step=5, key="mos_dcf_live") / 100.0
+        def rule1_eps_prices(eps_now, growth, years, terminal_pe, marr):
+            if pd.isna(eps_now) or eps_now <= 0: return np.nan, np.nan
+            if pd.isna(growth) or pd.isna(terminal_pe) or terminal_pe <= 0: return np.nan, np.nan
+            fut_eps = eps_now * ((1 + growth) ** years)
+            sticker = fut_eps * terminal_pe
+            fair    = sticker / ((1 + marr) ** years)
+            return sticker, fair
 
-    # Current EPS (last annual)
-    last_eps = df["EPS"].dropna().iloc[-1] if df["EPS"].notna().any() else np.nan
+        sticker, fair = rule1_eps_prices(last_eps, rule1_growth, years_eps, term_pe, discount)
+        mos_rule1 = fair * (1 - mos_eps_live) if not pd.isna(fair) else np.nan
 
-    # Analyst 5y EPS growth (Yahoo)
-    analyst_growth = get_analyst_eps_growth_5y(ticker)  # decimal (e.g., 0.12)
+        # FCF DCF (per share)
+        shares_last = df["SharesDiluted"].dropna().iloc[-1] if df["SharesDiluted"].notna().any() else np.nan
+        fcf_last    = df["FCF"].dropna().iloc[-1] if df["FCF"].notna().any() else np.nan
+        fcf_ps_last = fcf_last / shares_last if (not pd.isna(fcf_last) and not pd.isna(shares_last) and shares_last > 0) else np.nan
+        iv_dcf      = intrinsic_dcf_fcf(fcf_ps_last, growth_fcf, years_dcf, terminal_g, discount)
+        mos_dcf     = iv_dcf * (1 - mos_dcf_live) if not pd.isna(iv_dcf) else np.nan
 
-    # Historical EPS CAGR (10y)
-    eps_hist_cagr = series_cagr_gap(df["EPS"])
+        # Metrics
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Sticker (Rule #1 EPS)", "—" if pd.isna(sticker) else f"${sticker:,.2f}")
+        k2.metric("Fair Value (PV @ MARR)", "—" if pd.isna(fair) else f"${fair:,.2f}")
+        k3.metric(f"MOS Price (EPS, {int(mos_eps_live*100)}%)", "—" if pd.isna(mos_rule1) else f"${mos_rule1:,.2f}")
+        k4.metric("Current Price", "—" if pd.isna(current_price) else f"${current_price:,.2f}")
 
-    # Rule #1 growth used = lower of (user, hist, analyst), cap at 15%
-    candidates = [g for g in [growth_eps_user, eps_hist_cagr, analyst_growth] if not pd.isna(g) and g >= 0]
-    rule1_growth = min(candidates) if candidates else np.nan
-    if not pd.isna(rule1_growth):
-        rule1_growth = min(rule1_growth, 0.15)  # cap 15%
+        j1, j2 = st.columns(2)
+        j1.metric("DCF Intrinsic / share", "—" if pd.isna(iv_dcf) else f"${iv_dcf:,.2f}")
+        j2.metric(f"MOS Price (DCF, {int(mos_dcf_live*100)}%)", "—" if pd.isna(mos_dcf) else f"${mos_dcf:,.2f}")
 
-    # Current price
-    if using_av:
-        current_price = get_price_alpha_vantage(ticker, AV_KEY) if key_ok else np.nan
-    else:
-        current_price = get_price_fmp(ticker, FMP_KEY) if key_ok else np.nan
+        st.caption(f"Rule #1 growth used: {'—' if pd.isna(rule1_growth) else f'{rule1_growth*100:.1f}%'} · Terminal P/E: {'—' if pd.isna(term_pe) else f'{term_pe:.1f}'}")
 
-    # Current P/E (fallback)
-    current_pe = np.nan
-    if not pd.isna(current_price) and not pd.isna(last_eps) and last_eps > 0:
-        current_pe = current_price / last_eps
+    # -------- Summary (AI) --------
+    with tabs[4]:
+        st.subheader("Value‑Investor Summary (OpenAI)")
+        if not OPENAI_KEY:
+            st.info("Add **OPENAI_API_KEY** in Streamlit Secrets to enable this summary.")
+        else:
+            if st.button("Generate Summary"):
+                try:
+                    from openai import OpenAI
+                    client = OpenAI(api_key=OPENAI_KEY)
+                    sales_cagr_10 = series_cagr_gap(df["Revenue"])
+                    eps_cagr_10   = series_cagr_gap(df["EPS"])
+                    eqty_cagr_10  = series_cagr_gap(df["Equity"])
+                    fcf_cagr_10   = series_cagr_gap(df["FCF"])
+                    roic_avg_10   = safe_mean(df["ROIC"])
+                    context = {
+                        "ticker": ticker,
+                        "years": list(map(int, df.index.tolist())),
+                        "big5_10y": {
+                            "sales_cagr": float(sales_cagr_10) if not pd.isna(sales_cagr_10) else None,
+                            "eps_cagr": float(eps_cagr_10) if not pd.isna(eps_cagr_10) else None,
+                            "equity_cagr": float(eqty_cagr_10) if not pd.isna(eqty_cagr_10) else None,
+                            "fcf_cagr": float(fcf_cagr_10) if not pd.isna(fcf_cagr_10) else None,
+                            "roic_avg": float(roic_avg_10) if not pd.isna(roic_avg_10) else None
+                        }
+                    }
+                    prompt = (
+                        "You are a disciplined value investor (Phil Town style). "
+                        "Use the structured data to judge 10% rule compliance, mention notable 10/5/3/1 trends, "
+                        "and comment on whether valuations appear conservative relative to a quality business."
+                        "Be concise (<160 words) and neutral."
+                    )
+                    resp = client.chat.completions.create(
+                        model="gpt-4o-mini",
+                        messages=[{"role":"user","content": prompt + "\n\n" + str(context)}],
+                        temperature=0.3,
+                        max_tokens=300,
+                    )
+                    st.write(resp.choices[0].message.content)
+                except Exception as e:
+                    st.error(f"OpenAI error: {e}")
 
-    # Terminal P/E used
-    if auto_pe and not pd.isna(rule1_growth):
-        pe_from_growth = (rule1_growth * 100.0) * 2.0
-        choices = [pe_from_growth]
-        if not pd.isna(current_pe) and current_pe > 0:
-            choices.append(current_pe)
-        term_pe = min(min(choices), 50.0) if choices else np.nan
-    else:
-        term_pe = terminal_pe_manual
-
-    # Rule #1 EPS: Sticker -> PV@MARR -> MOS (live)
-    def rule1_eps_to_prices(eps_now, growth, years, terminal_pe, marr):
-        if pd.isna(eps_now) or eps_now <= 0: return np.nan, np.nan
-        if pd.isna(growth) or growth < 0: return np.nan, np.nan
-        if pd.isna(terminal_pe) or terminal_pe <= 0: return np.nan, np.nan
-        fut_eps = eps_now * ((1 + growth) ** years)
-        sticker = fut_eps * terminal_pe
-        fair = sticker / ((1 + marr) ** years)
-        return sticker, fair
-
-    sticker_price, fair_value = rule1_eps_to_prices(last_eps, rule1_growth, years_eps, term_pe, discount)
-    mos_price_rule1 = fair_value * (1.0 - mos_eps_live) if not pd.isna(fair_value) else np.nan
-
-    # FCF DCF (per-share)
-    shares_last = df["SharesDiluted"].dropna().iloc[-1] if "SharesDiluted" in df and df["SharesDiluted"].notna().any() else np.nan
-    fcf_last = df["FCF"].dropna().iloc[-1] if df["FCF"].notna().any() else np.nan
-    fcf_per_share_last = (fcf_last / shares_last) if (not pd.isna(fcf_last) and not pd.isna(shares_last) and shares_last > 0) else np.nan
-
-    iv_dcf = intrinsic_dcf_fcf(fcf_per_share_last, growth_fcf, years_dcf, terminal_g, discount)
-    mos_price_dcf = iv_dcf * (1.0 - mos_dcf_live) if not pd.isna(iv_dcf) else np.nan
-
-    # Display valuations
-    colv1, colv2, colv3, colv4 = st.columns(4)
-    colv1.metric("Sticker Price (Rule #1 EPS)", f"${sticker_price:,.2f}" if not pd.isna(sticker_price) else "—")
-    colv2.metric("Fair Value (PV @ MARR)", f"${fair_value:,.2f}" if not pd.isna(fair_value) else "—")
-    colv3.metric(f"MOS Price (EPS, {int(mos_eps_live*100)}%)", f"${mos_price_rule1:,.2f}" if not pd.isna(mos_price_rule1) else "—")
-    colv4.metric("Current Price", f"${current_price:,.2f}" if not pd.isna(current_price) else "—")
-
-    colv5, colv6, colv7, colv8 = st.columns(4)
-    colv5.metric("Rule #1 Growth Used", "—" if pd.isna(rule1_growth) else f"{rule1_growth*100:.1f}%")
-    colv6.metric("Terminal P/E Used", "—" if pd.isna(term_pe) else f"{term_pe:.1f}")
-    colv7.metric("DCF Intrinsic / sh.", f"${iv_dcf:,.2f}" if not pd.isna(iv_dcf) else "—")
-    colv8.metric(f"MOS Price (DCF, {int(mos_dcf_live*100)}%)", f"${mos_price_dcf:,.2f}" if not pd.isna(mos_price_dcf) else "—")
-
-    # Helpful caption tying back to Rule #1 choices
-    rule1_growth_text = "—" if pd.isna(rule1_growth) else f"{rule1_growth*100:.1f}%"
-    term_pe_text = "—" if pd.isna(term_pe) else f"{term_pe:.1f}"
-    st.caption(
-        "Growth rows show **CAGR**; 'Last 1yr' is **YoY**. ROIC rows show **averages**; 'Last 1yr' is the most recent ROIC.  \n"
-        f"**Rule #1 EPS settings used:** Growth = {rule1_growth_text} · Terminal P/E = {term_pe_text}."
-    )
-
-    # ---------- Value-Investor Summary (OpenAI) ----------
-    st.markdown("### Value-Investor Summary (OpenAI)")
-    if not OPENAI_KEY:
-        st.info("Add **OPENAI_API_KEY** in Secrets to enable the summary.")
-    else:
-        want = st.button("Generate Summary with OpenAI")
-        if want:
-            try:
-                from openai import OpenAI
-                client = OpenAI(api_key=OPENAI_KEY)
-                context = {
-                    "ticker": ticker,
-                    "years": list(map(int, df.index.tolist())),
-                    "big5_10y": {
-                        "sales_cagr": float(sales_cagr_10) if not pd.isna(sales_cagr_10) else None,
-                        "eps_cagr": float(eps_cagr_10) if not pd.isna(eps_cagr_10) else None,
-                        "equity_cagr": float(eqty_cagr_10) if not pd.isna(eqty_cagr_10) else None,
-                        "fcf_cagr": float(fcf_cagr_10) if not pd.isna(fcf_cagr_10) else None,
-                        "roic_avg": float(roic_avg_10) if not pd.isna(roic_avg_10) else None
-                    },
-                    "breakdowns": {
-                        "Sales": sales_b, "EPS": eps_b, "Equity": eqty_b, "FCF": fcf_b, "ROIC": roic_b
-                    },
-                    "rule1": {
-                        "eps_last": float(last_eps) if not pd.isna(last_eps) else None,
-                        "growth_used": float(rule1_growth) if not pd.isna(rule1_growth) else None,
-                        "terminal_pe": float(term_pe) if not pd.isna(term_pe) else None,
-                        "sticker": float(sticker_price) if not pd.isna(sticker_price) else None,
-                        "fair_value": float(fair_value) if not pd.isna(fair_value) else None,
-                        "mos_price": float(mos_price_rule1) if not pd.isna(mos_price_rule1) else None,
-                    },
-                    "dcf": {
-                        "fcf_per_share_last": float(fcf_per_share_last) if not pd.isna(fcf_per_share_last) else None,
-                        "iv_dcf": float(iv_dcf) if not pd.isna(iv_dcf) else None,
-                        "discount": float(discount)
-                    },
-                    "current_price": float(current_price) if not pd.isna(current_price) else None
-                }
-                prompt = (
-                    "You are a disciplined value investor (Phil Town style). "
-                    "Use the structured data to judge 10% rule compliance (Sales/EPS/Equity/FCF CAGRs and 10-yr Avg ROIC), "
-                    "comment on the 10/5/3/1 trends, and compare the Rule #1 EPS MOS & DCF intrinsic values to the current price. "
-                    "Be concise (<180 words), neutral, and focus on business quality and price."
-                )
-                resp = client.chat.completions.create(
-                    model="gpt-4o-mini",
-                    messages=[{"role":"user","content": prompt + "\n\n" + str(context)}],
-                    temperature=0.3,
-                    max_tokens=350,
-                )
-                st.write(resp.choices[0].message.content)
-            except Exception as e:
-                st.error(f"OpenAI error: {e}")
-
-    # ---------- Raw + charts ----------
-    with st.expander("Raw series used"):
-        st.dataframe(df)
-
-    with st.expander("Mini charts"):
-        cc1, cc2, cc3 = st.columns(3)
-        cc1.line_chart(df[["Revenue","FCF"]].dropna(), height=220)
-        cc2.line_chart(df[["EPS"]].dropna(), height=220)
-        cc3.line_chart(df[["ROIC"]].dropna(), height=220)
-
-else:
-    st.info("Enter a ticker and click **Search**. Choose provider in the sidebar and confirm your API key in Secrets.")
+    # -------- Diagnostics --------
+    with tabs[5]:
+        st.subheader("Data Diagnostics")
+        st.write("Non‑missing values per series (higher is better):")
+        st.json(diag)
+        with st.expander("Raw data"):
+            st.dataframe(df, use_container_width=True)
+        st.caption("If EPS is missing or odd on Alpha Vantage, switch to FMP. Financials for some tickers vary by provider, fiscal year alignment, or field naming.")
