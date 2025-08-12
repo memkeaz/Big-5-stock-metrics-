@@ -26,12 +26,11 @@ st.markdown(
 
 # =================== Header ===================
 st.title("Phil Town Big 5 Screener")
-st.caption("Check the Big 5 (Sales, EPS, Equity, FCF CAGRs + 10‑yr Avg ROIC), view 10/5/3/1 trend breakdowns, and run Rule #1 EPS & FCF‑DCF valuations with adjustable MOS.")
+st.caption("Check the Big 5 (Sales, EPS, Equity, FCF CAGRs + 10-yr Avg ROIC), view 10/5/3/1 trend breakdowns, and run Rule #1 EPS & FCF-DCF valuations with adjustable MOS.")
 
-# =================== Secrets ===================
-OPENAI_KEY = st.secrets.get("OPENAI_API_KEY", "").strip()
-AV_KEY     = st.secrets.get("ALPHAVANTAGE_API_KEY", "").strip()
-FMP_KEY    = st.secrets.get("FMP_API_KEY", "").strip()
+# =================== Secrets (only for data providers) ===================
+AV_KEY  = st.secrets.get("ALPHAVANTAGE_API_KEY", "").strip()
+FMP_KEY = st.secrets.get("FMP_API_KEY", "").strip()
 
 # =================== Controls (single Search button) ===================
 with st.form("search"):
@@ -39,7 +38,7 @@ with st.form("search"):
     with top1:
         ticker = st.text_input("Ticker", value="ADBE").strip().upper()
     with top2:
-        provider = st.selectbox("Data source", ["FMP", "Alpha Vantage"], index=0)
+        provider = st.selectbox("Data source", ["Yahoo Finance", "FMP", "Alpha Vantage"], index=0)
     adv = st.expander("Valuation Settings", expanded=False)
     with adv:
         st.markdown("**Rule #1 EPS (Phil Town)**")
@@ -88,99 +87,104 @@ def safe_mean(s: pd.Series) -> float:
 
 def pct(x): return "—" if pd.isna(x) else f"{x*100:.1f}%"
 
-# =================== Fetchers ===================
-AV_BASE  = "https://www.alphavantage.co/query"
-FMP_BASE = "https://financialmodelingprep.com/api/v3"
+def normalize_capex(capex: pd.Series) -> pd.Series:
+    if capex is None or capex.empty: return capex
+    return capex.apply(lambda v: abs(v) if not pd.isna(v) else v)
+
+def roic_series_from(nopat: pd.Series, debt: pd.Series, equity: pd.Series, cash: pd.Series) -> pd.Series:
+    ic = (debt.fillna(0) + equity.fillna(0) - cash.fillna(0))
+    ic = ic.replace({0: np.nan})
+    ic_avg = (ic + ic.shift(1)) / 2.0
+    with np.errstate(divide="ignore", invalid="ignore"):
+        roic = (nopat / ic_avg).replace([np.inf, -np.inf], np.nan)
+    return roic
 
 def _diag(df: pd.DataFrame):
     return {k:int(v) for k,v in df.notna().sum().to_dict().items()}
 
-# ----- Alpha Vantage (patched) -----
-def av_get(fn: str, symbol: str, apikey: str):
-    p = {"function": fn, "symbol": symbol, "apikey": apikey}
-    r = requests.get(AV_BASE, params=p, timeout=30)
-    r.raise_for_status()
-    return r.json().get("annualReports", [])
+# =================== Data fetchers ===================
+AV_BASE  = "https://www.alphavantage.co/query"
+FMP_BASE = "https://financialmodelingprep.com/api/v3"
 
-def av_series(reports, field) -> pd.Series:
-    if not reports: return pd.Series(dtype="float64")
-    rows = []
-    for rep in reports:
-        y = pd.to_datetime(rep.get("fiscalDateEnding", ""), errors="coerce").year
-        if pd.isna(y): continue
-        rows.append((int(y), pd.to_numeric(rep.get(field), errors="coerce")))
-    if not rows: return pd.Series(dtype="float64")
-    s = pd.Series(dict(rows)).sort_index()
-    return s.iloc[-11:].astype("float64")
-
-def av_series_sum(reports, fields) -> pd.Series:
-    total = None
-    for f in fields:
-        s = av_series(reports, f)
-        total = s if total is None else total.add(s, fill_value=0)
-    return total if total is not None else pd.Series(dtype="float64")
-
+# ---------- Yahoo (yfinance) ----------
 @st.cache_data(show_spinner=False, ttl=1800)
-def fetch_alpha_vantage(symbol: str, apikey: str):
-    inc = av_get("INCOME_STATEMENT", symbol, apikey)
-    bal = av_get("BALANCE_SHEET",  symbol, apikey)
-    cfs = av_get("CASH_FLOW",      symbol, apikey)
+def fetch_yahoo(symbol: str):
+    try:
+        import yfinance as yf
+    except Exception as e:
+        raise RuntimeError("Missing yfinance. Add to requirements.txt") from e
 
-    revenue        = av_series(inc, "totalRevenue")
-    net_income     = av_series(inc, "netIncome")
-    diluted_eps    = av_series(inc, "dilutedEPS")
-    ebit           = av_series(inc, "ebit")
-    tax_expense    = av_series(inc, "incomeTaxExpense")
-    pretax_income  = av_series(inc, "incomeBeforeTax")
-    shares_diluted = av_series(bal, "commonStockSharesOutstanding")  # proxy
-    equity         = av_series(bal, "totalShareholderEquity")
+    tk = yf.Ticker(symbol)
 
-    debt_primary   = av_series_sum(bal, ["shortTermDebt", "longTermDebt"])
-    debt_alt       = av_series_sum(bal, ["currentLongTermDebt", "longTermDebtNoncurrent"])
-    debt_fb1       = av_series(bal, "totalDebt")
-    debt_fb2       = av_series(bal, "shortLongTermDebtTotal")
-    total_debt     = debt_primary if (not debt_primary.empty) else (debt_alt if not debt_alt.empty else (debt_fb1 if not debt_fb1.empty else debt_fb2))
+    def tidy(df):
+        if df is None or df.empty: return pd.DataFrame()
+        df = df.copy()
+        years = [int(pd.to_datetime(c).year) for c in df.columns]
+        df.columns = years
+        df = df.reindex(sorted(df.columns), axis=1).iloc[:, -11:]
+        return df.apply(pd.to_numeric, errors="coerce")
 
-    cash = av_series(bal, "cashAndCashEquivalentsAtCarryingValue")
-    if cash.empty: cash = av_series(bal, "cashAndCashEquivalents")
-    if cash.empty: cash = av_series(bal, "cashAndShortTermInvestments")
+    inc = tidy(tk.get_income_stmt(freq="annual") if hasattr(tk, "get_income_stmt") else tk.financials)
+    bal = tidy(tk.get_balance_sheet(freq="annual") if hasattr(tk, "get_balance_sheet") else tk.balance_sheet)
+    cfs = tidy(tk.get_cashflow(freq="annual") if hasattr(tk, "get_cashflow") else tk.cashflow)
 
-    cfo   = av_series(cfs, "operatingCashflow")
-    capex = av_series(cfs, "capitalExpenditures")
+    def pick(df, names):
+        if df is None or df.empty: return pd.Series(dtype="float64")
+        for n in names:
+            if n in df.index: return df.loc[n]
+        idx = {i.lower().replace(" ", ""): i for i in df.index}
+        for n in names:
+            key = n.lower().replace(" ", "")
+            for k, orig in idx.items():
+                if key in k: return df.loc[orig]
+        return pd.Series(dtype="float64")
 
-    years = sorted(set(revenue.index) | set(net_income.index) | set(diluted_eps.index) |
-                   set(shares_diluted.index) | set(ebit.index) | set(tax_expense.index) |
-                   set(pretax_income.index) | set(equity.index) | set(total_debt.index) |
-                   set(cash.index) | set(cfo.index) | set(capex.index))[-11:]
+    revenue     = pick(inc, ["Total Revenue","Revenue","TotalOperatingRevenues"])
+    net_income  = pick(inc, ["Net Income","NetIncome","Net Income Applicable To Common Shares"])
+    diluted_eps = pick(inc, ["Diluted EPS","DilutedEPS","EPS Diluted"])
+    ebit        = pick(inc, ["EBIT","Operating Income","Earnings Before Interest and Taxes","Operating Income"])
+
+    tax_expense = pick(inc, ["Income Tax Expense","Provision For Income Taxes"])
+    pretax      = pick(inc, ["Income Before Tax","Earnings Before Tax","Pretax Income"])
+    shares      = pick(inc, ["Weighted Average Shares Diluted","Weighted Average Diluted Shares Outstanding","Diluted Average Shares"])
+
+    equity      = pick(bal, ["Total Stockholder Equity","TotalStockholderEquity","Common Stock Equity"])
+    total_debt  = pick(bal, ["Total Debt","Short Long Term Debt","ShortLongTermDebtTotal"])
+    if total_debt.isna().all():
+        total_debt = pick(bal, ["Current Debt","Long Term Debt","LongTermDebt","ShortTermDebt"]).fillna(0)
+
+    cash        = pick(bal, ["Cash And Cash Equivalents","CashAndCashEquivalents","Cash"])
+
+    cfo   = pick(cfs, ["Operating Cash Flow","Total Cash From Operating Activities","NetCashProvidedByUsedInOperatingActivities"])
+    capex = normalize_capex(pick(cfs, ["Capital Expenditure","CapitalExpenditures","Investments In Property Plant And Equipment","Purchase Of Property Plant And Equipment"]))
+
+    years = sorted(set(revenue.index) | set(net_income.index) | set(diluted_eps.index) | set(shares.index) |
+                   set(ebit.index) | set(tax_expense.index) | set(pretax.index) | set(equity.index) |
+                   set(total_debt.index) | set(cash.index) | set(cfo.index) | set(capex.index))[-11:]
 
     def A(s): return s.reindex(years).astype("float64") if years else pd.Series(dtype="float64")
-    revenue, net_income, diluted_eps, shares_diluted, ebit, tax_expense, pretax_income, equity, total_debt, cash, cfo, capex = [
-        A(x) for x in [revenue, net_income, diluted_eps, shares_diluted, ebit, tax_expense, pretax_income, equity, total_debt, cash, cfo, capex]
+    revenue, net_income, eps, shares, ebit, tax_expense, pretax, equity, total_debt, cash, cfo, capex = [
+        A(x) for x in [revenue, net_income, diluted_eps, shares, ebit, tax_expense, pretax, equity, total_debt, cash, cfo, capex]
     ]
 
-    eps = diluted_eps.copy()
-    if eps.isna().all() and not net_income.isna().all() and not shares_diluted.isna().all():
+    if eps.isna().all() and not net_income.isna().all() and not shares.isna().all():
         with np.errstate(invalid="ignore", divide="ignore"):
-            eps = net_income / shares_diluted.replace({0: np.nan})  # fallback, not perfect
+            eps = net_income / shares.replace({0: np.nan})
 
     fcf = (cfo - capex) if (not cfo.isna().all() and not capex.isna().all()) else pd.Series([np.nan]*len(years), index=years)
-
     with np.errstate(divide="ignore", invalid="ignore"):
-        tax_rate = (tax_expense / pretax_income).clip(0, 1)
+        tax_rate = (tax_expense / pretax).clip(0, 1)
     nopat = (ebit * (1 - tax_rate.fillna(0.21))) if not ebit.isna().all() else net_income
-    invested_capital = (total_debt.fillna(0) + equity.fillna(0) - cash.fillna(0))
-    invested_capital = invested_capital.replace({0: np.nan})  # avoid division blowups
-    with np.errstate(divide="ignore", invalid="ignore"):
-        roic = (nopat / invested_capital).replace([np.inf, -np.inf], np.nan)
+    roic = roic_series_from(nopat, total_debt, equity, cash)
 
     df = pd.DataFrame({
-        "Revenue": revenue, "EPS": eps, "Equity": equity, "FCF": fcf, "ROIC": roic, "SharesDiluted": shares_diluted
+        "Revenue": revenue, "EPS": eps, "Equity": equity, "FCF": fcf, "ROIC": roic, "SharesDiluted": shares
     }).sort_index().tail(11)
 
     diag = _diag(df)
-    return df, years, "Alpha Vantage (patched)", diag
+    return df, years, "Yahoo Finance (yfinance)", diag
 
-# ----- FMP (recommended for EPS accuracy) -----
+# ---------- FMP ----------
 def fmp_get(path: str, apikey: str, params=None):
     if params is None: params = {}
     params["apikey"] = apikey
@@ -194,9 +198,10 @@ def fmp_series(reports, field) -> pd.Series:
     for rep in reports:
         y = pd.to_datetime(rep.get("date") or rep.get("calendarYear"), errors="coerce").year
         if pd.isna(y):
-            try: y = int(rep.get("calendarYear")); 
+            try: y = int(rep.get("calendarYear"))
             except: continue
-        rows.append((int(y), pd.to_numeric(rep.get(field), errors="coerce")))
+        val = pd.to_numeric(rep.get(field, None), errors="coerce")
+        rows.append((int(y), val))
     if not rows: return pd.Series(dtype="float64")
     s = pd.Series(dict(rows)).sort_index()
     return s.iloc[-11:].astype("float64")
@@ -220,7 +225,7 @@ def fetch_fmp(symbol: str, apikey: str):
     cash       = fmp_series(bal, "cashAndCashEquivalents")
 
     cfo   = fmp_series(cfs, "netCashProvidedByOperatingActivities")
-    capex = fmp_series(cfs, "capitalExpenditure")
+    capex = normalize_capex(fmp_series(cfs, "capitalExpenditure"))
 
     years = sorted(set(revenue.index) | set(net_income.index) | set(diluted_eps.index) |
                    set(diluted_shares.index) | set(ebit.index) | set(tax_expense.index) |
@@ -242,9 +247,7 @@ def fetch_fmp(symbol: str, apikey: str):
     with np.errstate(divide="ignore", invalid="ignore"):
         tax_rate = (tax_expense / pretax_income).clip(0, 1)
     nopat = (ebit * (1 - tax_rate.fillna(0.21))) if not ebit.isna().all() else net_income
-    invested_capital = (total_debt.fillna(0) + equity.fillna(0) - cash.fillna(0)).replace({0: np.nan})
-    with np.errstate(divide="ignore", invalid="ignore"):
-        roic = (nopat / invested_capital).replace([np.inf, -np.inf], np.nan)
+    roic = roic_series_from(nopat, total_debt, equity, cash)
 
     df = pd.DataFrame({
         "Revenue": revenue, "EPS": eps, "Equity": equity, "FCF": fcf, "ROIC": roic, "SharesDiluted": diluted_shares
@@ -253,26 +256,115 @@ def fetch_fmp(symbol: str, apikey: str):
     diag = _diag(df)
     return df, years, "FMP", diag
 
-# =================== Price & Analyst growth ===================
+# ---------- Alpha Vantage (patched) ----------
+def av_get(fn: str, symbol: str, apikey: str):
+    params = {"function": fn, "symbol": symbol, "apikey": apikey}
+    r = requests.get(AV_BASE, params=params, timeout=30)
+    r.raise_for_status()
+    j = r.json()
+    return j.get("annualReports", [])
+
+def av_series(reports, field) -> pd.Series:
+    if not reports: return pd.Series(dtype="float64")
+    rows = []
+    for rep in reports:
+        y = pd.to_datetime(rep.get("fiscalDateEnding", ""), errors="coerce").year
+        if pd.isna(y): continue
+        val = pd.to_numeric(rep.get(field, None), errors="coerce")
+        rows.append((int(y), val))
+    if not rows: return pd.Series(dtype="float64")
+    s = pd.Series(dict(rows)).sort_index()
+    return s.iloc[-11:].astype("float64")
+
+def av_series_sum(reports, fields) -> pd.Series:
+    tot = None
+    for f in fields:
+        s = av_series(reports, f)
+        tot = s if tot is None else tot.add(s, fill_value=0)
+    return tot if tot is not None else pd.Series(dtype="float64")
+
+@st.cache_data(show_spinner=False, ttl=1800)
+def fetch_alpha_vantage(symbol: str, apikey: str):
+    inc = av_get("INCOME_STATEMENT", symbol, apikey)
+    bal = av_get("BALANCE_SHEET",  symbol, apikey)
+    cfs = av_get("CASH_FLOW",      symbol, apikey)
+
+    revenue        = av_series(inc, "totalRevenue")
+    net_income     = av_series(inc, "netIncome")
+    diluted_eps    = av_series(inc, "dilutedEPS")
+    ebit           = av_series(inc, "ebit")
+    tax_expense    = av_series(inc, "incomeTaxExpense")
+    pretax_income  = av_series(inc, "incomeBeforeTax")
+
+    shares_diluted = av_series(bal, "commonStockSharesOutstanding")
+    equity     = av_series(bal, "totalShareholderEquity")
+    debt1      = av_series_sum(bal, ["shortTermDebt","longTermDebt"])
+    debt2      = av_series_sum(bal, ["currentLongTermDebt","longTermDebtNoncurrent"])
+    total_debt = debt1 if not (debt1 is None or debt1.empty) else debt2
+    if total_debt is None or total_debt.empty: total_debt = av_series(bal, "totalDebt")
+    if total_debt is None or total_debt.empty: total_debt = av_series(bal, "shortLongTermDebtTotal")
+
+    cash = av_series(bal, "cashAndCashEquivalentsAtCarryingValue")
+    if cash.empty: cash = av_series(bal, "cashAndCashEquivalents")
+    if cash.empty: cash = av_series(bal, "cashAndShortTermInvestments")
+
+    cfo   = av_series(cfs, "operatingCashflow")
+    capex = normalize_capex(av_series(cfs, "capitalExpenditures"))
+
+    years = sorted(set(revenue.index) | set(net_income.index) | set(diluted_eps.index) |
+                   set(shares_diluted.index) | set(ebit.index) | set(tax_expense.index) |
+                   set(pretax_income.index) | set(equity.index) | set(total_debt.index) |
+                   set(cash.index) | set(cfo.index) | set(capex.index))[-11:]
+
+    def A(s): return s.reindex(years).astype("float64") if years else pd.Series(dtype="float64")
+    revenue, net_income, diluted_eps, shares_diluted, ebit, tax_expense, pretax_income, equity, total_debt, cash, cfo, capex = [
+        A(x) for x in [revenue, net_income, diluted_eps, shares_diluted, ebit, tax_expense, pretax_income, equity, total_debt, cash, cfo, capex]
+    ]
+
+    eps = diluted_eps.copy()
+    if eps.isna().all() and not net_income.isna().all() and not shares_diluted.isna().all():
+        with np.errstate(invalid="ignore", divide="ignore"):
+            eps = net_income / shares_diluted.replace({0: np.nan})
+
+    fcf = (cfo - capex) if (not cfo.isna().all() and not capex.isna().all()) else pd.Series([np.nan]*len(years), index=years)
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        tax_rate = (tax_expense / pretax_income).clip(0, 1)
+    nopat = (ebit * (1 - tax_rate.fillna(0.21))) if not ebit.isna().all() else net_income
+    roic = roic_series_from(nopat, total_debt, equity, cash)
+
+    df = pd.DataFrame({
+        "Revenue": revenue, "EPS": eps, "Equity": equity, "FCF": fcf, "ROIC": roic, "SharesDiluted": shares_diluted
+    }).sort_index().tail(11)
+
+    diag = _diag(df)
+    return df, years, "Alpha Vantage (patched)", diag
+
+# ---------- Price helpers ----------
+def get_price_fmp(symbol: str, apikey: str) -> float:
+    try:
+        j = requests.get(f"{FMP_BASE}/quote-short/{symbol}?apikey={apikey}", timeout=30).json()
+        if isinstance(j, list) and j: return float(j[0].get("price", "nan"))
+        return np.nan
+    except Exception:
+        return np.nan
+
 def get_price_alpha_vantage(symbol: str, apikey: str) -> float:
     try:
-        j = requests.get(
-            f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={symbol}&apikey={apikey}",
-            timeout=30
-        ).json()
+        j = requests.get(f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={symbol}&apikey={apikey}", timeout=30).json()
         return float(j.get("Global Quote", {}).get("05. price", "nan"))
     except Exception:
         return np.nan
 
-def get_price_fmp(symbol: str, apikey: str) -> float:
+def get_price_yahoo(symbol: str) -> float:
     try:
-        j = requests.get(f"{FMP_BASE}/quote-short/{symbol}?apikey={apikey}", timeout=30).json()
-        if isinstance(j, list) and j:
-            return float(j[0].get("price", "nan"))
-        return np.nan
+        import yfinance as yf
+        info = yf.Ticker(symbol).fast_info
+        return float(info["last_price"]) if "last_price" in info else np.nan
     except Exception:
         return np.nan
 
+# ---------- Analyst 5y EPS growth (Yahoo) ----------
 @st.cache_data(show_spinner=False, ttl=3600)
 def get_analyst_eps_growth_5y(symbol: str) -> float:
     try:
@@ -282,15 +374,15 @@ def get_analyst_eps_growth_5y(symbol: str) -> float:
         trend = j["quoteSummary"]["result"][0]["earningsTrend"]["trend"]
         for t in trend:
             if t.get("period") in ("+5y", "5y"):
-                raw = t.get("growth", {}).get("raw")
-                if raw is not None: return float(raw)
+                val = t.get("growth", {}).get("raw")
+                if val is not None: return float(val)
         lt = j["quoteSummary"]["result"][0]["earningsTrend"].get("longTermEpsGrowthRate", {})
-        if "raw" in lt and lt["raw"] is not None:
-            return float(lt["raw"])
+        if "raw" in lt and lt["raw"] is not None: return float(lt["raw"])
     except Exception:
         pass
     return np.nan
 
+# =================== Intrinsic (DCF helper) ===================
 def intrinsic_dcf_fcf(fps_last: float, growth: float, years: int, terminal_g: float, discount: float) -> float:
     if pd.isna(fps_last) or fps_last <= 0: return np.nan
     if discount <= terminal_g: return np.nan
@@ -306,21 +398,23 @@ def intrinsic_dcf_fcf(fps_last: float, growth: float, years: int, terminal_g: fl
 
 # =================== Run ===================
 if go:
-    using_av  = (provider == "Alpha Vantage")
-    have_key  = (AV_KEY if using_av else FMP_KEY)
-    if not have_key:
-        st.error("Missing API key in Streamlit Secrets for the selected provider.")
-        st.stop()
-
-    # Fetch
+    # Fetch data
     try:
-        if using_av:
-            df, years, source, diag = fetch_alpha_vantage(ticker, AV_KEY)
-            current_price = get_price_alpha_vantage(ticker, AV_KEY)
-            st.caption("Using Alpha Vantage — if EPS/ROIC looks off for ADBE, try **FMP**.")
-        else:
+        if provider == "Yahoo Finance":
+            df, years, source, diag = fetch_yahoo(ticker)
+            current_price = get_price_yahoo(ticker)
+        elif provider == "FMP":
+            if not FMP_KEY:
+                st.error("Missing FMP_API_KEY in Secrets.")
+                st.stop()
             df, years, source, diag = fetch_fmp(ticker, FMP_KEY)
             current_price = get_price_fmp(ticker, FMP_KEY)
+        else:  # Alpha Vantage
+            if not AV_KEY:
+                st.error("Missing ALPHAVANTAGE_API_KEY in Secrets.")
+                st.stop()
+            df, years, source, diag = fetch_alpha_vantage(ticker, AV_KEY)
+            current_price = get_price_alpha_vantage(ticker, AV_KEY)
     except Exception as e:
         st.error(f"Fetch error: {e}")
         st.stop()
@@ -330,8 +424,8 @@ if go:
         st.json(diag)
         st.stop()
 
-    # =================== SECTIONS ===================
-    tabs = st.tabs(["Overview", "Big 5", "Breakdowns", "Valuation", "Summary (AI)", "Diagnostics"])
+    # ====== TABS ======
+    tabs = st.tabs(["Overview", "Big 5", "Breakdowns", "Valuation", "Diagnostics"])
 
     # -------- Overview --------
     with tabs[0]:
@@ -341,7 +435,7 @@ if go:
         c2.metric("Current Price", "—" if pd.isna(current_price) else f"${current_price:,.2f}")
         c3.metric("Latest EPS", "—" if df['EPS'].dropna().empty else f"{df['EPS'].dropna().iloc[-1]:.2f}")
         c4.metric("Latest ROIC", "—" if df['ROIC'].dropna().empty else pct(df['ROIC'].dropna().iloc[-1]))
-        st.markdown('<span class="fine">Tip: If ADBE looks wrong on Alpha Vantage, switch to FMP (more reliable EPS).</span>', unsafe_allow_html=True)
+        st.markdown('<span class="fine">Tip: If ADBE looks wrong on Alpha Vantage, switch to Yahoo Finance or FMP.</span>', unsafe_allow_html=True)
         with st.expander("Quick charts"):
             cc1, cc2, cc3 = st.columns(3)
             cc1.line_chart(df[["Revenue","FCF"]].dropna(), height=200, use_container_width=True)
@@ -350,7 +444,7 @@ if go:
 
     # -------- Big 5 --------
     with tabs[1]:
-        st.subheader("Big 5 — 10‑Year Check")
+        st.subheader("Big 5 — 10-Year Check")
         sales_cagr_10 = series_cagr_gap(df["Revenue"])
         eps_cagr_10   = series_cagr_gap(df["EPS"])
         eqty_cagr_10  = series_cagr_gap(df["Equity"])
@@ -358,7 +452,7 @@ if go:
         roic_avg_10   = safe_mean(df["ROIC"])
         def pf(v): return "PASS ✅" if not pd.isna(v) and v >= 0.10 else ("—" if pd.isna(v) else "FAIL ❌")
         big5 = pd.DataFrame({
-            "Metric": ["Sales (Revenue) CAGR","EPS CAGR","Equity CAGR","FCF CAGR","ROIC (10‑yr Avg)"],
+            "Metric": ["Sales (Revenue) CAGR","EPS CAGR","Equity CAGR","FCF CAGR","ROIC (10-yr Avg)"],
             "Value (10y)":  [pct(sales_cagr_10), pct(eps_cagr_10), pct(eqty_cagr_10), pct(fcf_cagr_10), pct(roic_avg_10)],
             "Pass ≥10%?": [pf(sales_cagr_10), pf(eps_cagr_10), pf(eqty_cagr_10), pf(fcf_cagr_10), pf(roic_avg_10)]
         })
@@ -366,14 +460,32 @@ if go:
 
     # -------- Breakdowns --------
     with tabs[2]:
-        st.subheader("Trends: 10 / First‑5 / Last‑3 / Last‑1")
+        st.subheader("Trends: 10 / First-5 / Last-3 / Last-1")
+
         def breakdown_growth(s: pd.Series):
             s = s.dropna()
-            if len(s) < 2: return np.nan, np.nan, np.nan, np.nan
+            if len(s) < 2:
+                return np.nan, np.nan, np.nan, np.nan
             ten = series_cagr_gap(s)
-            first5 = cagr_over_years(s.iloc[0], s.iloc[min(4, len(s)-1)], int(s.index[0]), int(s.index[min(4, len(s)-1]))) if len(s) >= 5 else np.nan
-            last3  = cagr_over_years(s.iloc[-4], s.iloc[-1], int(s.index[-4]), int(s.index[-1])) if len(s) >= 4 else np.nan
-            last1  = yoy(s)
+            if len(s) >= 5:
+                first5 = cagr_over_years(
+                    s.iloc[0],
+                    s.iloc[min(4, len(s) - 1)],
+                    int(s.index[0]),
+                    int(s.index[min(4, len(s) - 1)])
+                )
+            else:
+                first5 = np.nan
+            if len(s) >= 4:
+                last3 = cagr_over_years(
+                    s.iloc[-4],
+                    s.iloc[-1],
+                    int(s.index[-4]),
+                    int(s.index[-1])
+                )
+            else:
+                last3 = np.nan
+            last1 = yoy(s)
             return ten, first5, last3, last1
 
         def breakdown_roic(s: pd.Series):
@@ -403,22 +515,29 @@ if go:
     # -------- Valuation --------
     with tabs[3]:
         st.subheader("Intrinsic Value")
-        # Live MOS sliders (mobile-friendly in-row)
+
+        # Live MOS sliders
         m1, m2 = st.columns(2)
         with m1: mos_eps_live = st.slider("MOS — Rule #1 EPS", 0, 90, int(mos_eps_default*100), step=5) / 100.0
         with m2: mos_dcf_live = st.slider("MOS — FCF DCF",   0, 90, int(mos_dcf_default*100), step=5) / 100.0
 
+        # EPS inputs
         last_eps = df["EPS"].dropna().iloc[-1] if df["EPS"].notna().any() else np.nan
         analyst_growth = get_analyst_eps_growth_5y(ticker)  # decimal, may be NaN
         eps_hist_cagr  = series_cagr_gap(df["EPS"])
 
-        # Rule #1 growth used = lower of (user, hist, analyst), capped at 15%
-        candidates = [g for g in [growth_fcf*0 + growth_eps_user, eps_hist_cagr, analyst_growth] if not pd.isna(g) and g >= 0]
+        # Rule #1 growth used = lower of (user, hist, analyst) capped at 15%
+        candidates = [g for g in [growth_eps_user, eps_hist_cagr, analyst_growth] if not pd.isna(g) and g >= 0]
         rule1_growth = min(candidates) if candidates else np.nan
         if not pd.isna(rule1_growth): rule1_growth = min(rule1_growth, 0.15)
 
         # Current price
-        current_price = (get_price_alpha_vantage(ticker, AV_KEY) if using_av else get_price_fmp(ticker, FMP_KEY))
+        if provider == "Yahoo Finance":
+            current_price = get_price_yahoo(ticker)
+        elif provider == "FMP":
+            current_price = get_price_fmp(ticker, FMP_KEY) if FMP_KEY else np.nan
+        else:
+            current_price = get_price_alpha_vantage(ticker, AV_KEY) if AV_KEY else np.nan
 
         current_pe = np.nan
         if not pd.isna(current_price) and not pd.isna(last_eps) and last_eps > 0:
@@ -464,53 +583,11 @@ if go:
 
         st.caption(f"Rule #1 growth used: {'—' if pd.isna(rule1_growth) else f'{rule1_growth*100:.1f}%'} · Terminal P/E: {'—' if pd.isna(term_pe) else f'{term_pe:.1f}'}")
 
-    # -------- Summary (AI) --------
-    with tabs[4]:
-        st.subheader("Value‑Investor Summary (OpenAI)")
-        if not OPENAI_KEY:
-            st.info("Add **OPENAI_API_KEY** in Streamlit Secrets to enable this summary.")
-        else:
-            if st.button("Generate Summary"):
-                try:
-                    from openai import OpenAI
-                    client = OpenAI(api_key=OPENAI_KEY)
-                    sales_cagr_10 = series_cagr_gap(df["Revenue"])
-                    eps_cagr_10   = series_cagr_gap(df["EPS"])
-                    eqty_cagr_10  = series_cagr_gap(df["Equity"])
-                    fcf_cagr_10   = series_cagr_gap(df["FCF"])
-                    roic_avg_10   = safe_mean(df["ROIC"])
-                    context = {
-                        "ticker": ticker,
-                        "years": list(map(int, df.index.tolist())),
-                        "big5_10y": {
-                            "sales_cagr": float(sales_cagr_10) if not pd.isna(sales_cagr_10) else None,
-                            "eps_cagr": float(eps_cagr_10) if not pd.isna(eps_cagr_10) else None,
-                            "equity_cagr": float(eqty_cagr_10) if not pd.isna(eqty_cagr_10) else None,
-                            "fcf_cagr": float(fcf_cagr_10) if not pd.isna(fcf_cagr_10) else None,
-                            "roic_avg": float(roic_avg_10) if not pd.isna(roic_avg_10) else None
-                        }
-                    }
-                    prompt = (
-                        "You are a disciplined value investor (Phil Town style). "
-                        "Use the structured data to judge 10% rule compliance, mention notable 10/5/3/1 trends, "
-                        "and comment on whether valuations appear conservative relative to a quality business."
-                        "Be concise (<160 words) and neutral."
-                    )
-                    resp = client.chat.completions.create(
-                        model="gpt-4o-mini",
-                        messages=[{"role":"user","content": prompt + "\n\n" + str(context)}],
-                        temperature=0.3,
-                        max_tokens=300,
-                    )
-                    st.write(resp.choices[0].message.content)
-                except Exception as e:
-                    st.error(f"OpenAI error: {e}")
-
     # -------- Diagnostics --------
-    with tabs[5]:
+    with tabs[4]:
         st.subheader("Data Diagnostics")
-        st.write("Non‑missing values per series (higher is better):")
+        st.write("Non-missing values per series (higher is better):")
         st.json(diag)
         with st.expander("Raw data"):
             st.dataframe(df, use_container_width=True)
-        st.caption("If EPS is missing or odd on Alpha Vantage, switch to FMP. Financials for some tickers vary by provider, fiscal year alignment, or field naming.")
+        st.caption("If EPS is missing or odd on Alpha Vantage, switch to Yahoo Finance or FMP. Fiscal year alignment and field naming vary by provider.")
