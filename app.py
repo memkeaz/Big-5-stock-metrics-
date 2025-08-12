@@ -21,19 +21,19 @@ st.markdown(
 
 # =================== Header ===================
 st.title("Phil Town Big 5 Screener")
-st.caption("Big 5 (Sales, EPS, Equity, FCF CAGRs + 10-yr Avg ROIC), 10/5/3/1 breakdowns, and Rule #1 EPS & FCF-DCF valuations with adjustable MOS sliders.")
+st.caption("Big 5 (Sales, EPS, Equity, FCF CAGRs + 10-yr Avg ROIC), 10/5/3/1 breakdowns, and two valuations: Rule #1 EPS & FCF‑DCF. One MOS slider applies to both valuations.")
 
 # =================== Secrets ===================
 AV_KEY  = st.secrets.get("ALPHAVANTAGE_API_KEY", "").strip()
 FMP_KEY = st.secrets.get("FMP_API_KEY", "").strip()
 
-# =================== Session State (store fetched data) ===================
+# =================== Session State ===================
 if "data" not in st.session_state:
-    st.session_state.data = None  # tuple: (df, years, source, diag, current_price)
+    st.session_state.data = None  # (df, years, source, diag, current_price, used_provider_name)
 if "last_query" not in st.session_state:
     st.session_state.last_query = {"ticker": None, "provider": None}
 
-# =================== Controls ===================
+# =================== Controls (fetch only on Search) ===================
 with st.form("search"):
     c1, c2 = st.columns([2, 1])
     with c1:
@@ -43,12 +43,14 @@ with st.form("search"):
             "Data source",
             ["Auto (FMP→Yahoo→AV)", "Yahoo Finance", "FMP", "Alpha Vantage"],
             index=0 if st.session_state.last_query.get("provider") is None else
-                  ["Auto (FMP→Yahoo→AV)", "Yahoo Finance", "FMP", "Alpha Vantage"].index(
-                      st.session_state.last_query.get("provider", "Auto (FMP→Yahoo→AV)")
-                  )
+                ["Auto (FMP→Yahoo→AV)", "Yahoo Finance", "FMP", "Alpha Vantage"]
+                .index(st.session_state.last_query.get("provider", "Auto (FMP→Yahoo→AV)"))
         )
 
     with st.expander("Valuation Settings", expanded=False):
+        st.markdown("**Discount / MARR & Growth Assumptions**")
+        discount   = st.number_input("MARR / Discount rate (%, both models)", 4.0, 20.0, 10.0, step=0.5, key="discount") / 100.0
+
         st.markdown("**Rule #1 EPS (Phil Town)**")
         years_eps        = st.slider("Years (EPS projection)", 5, 15, 10, key="years_eps")
         growth_eps_user  = st.number_input("Your EPS growth estimate (annual, %)", 0.0, 50.0, 12.0, step=0.5, key="growth_eps_user") / 100.0
@@ -60,12 +62,10 @@ with st.form("search"):
         years_dcf  = st.slider("Years (DCF)", 5, 15, 10, key="years_dcf")
         growth_fcf = st.number_input("FCF growth (annual, %)", 0.0, 50.0, 10.0, step=0.5, key="growth_fcf") / 100.0
         terminal_g = st.number_input("Terminal growth (FCF, %)", 0.0, 6.0, 3.0, step=0.25, key="terminal_g") / 100.0
-        discount   = st.number_input("MARR / Discount rate (%, both models)", 4.0, 20.0, 10.0, step=0.5, key="discount") / 100.0
 
         st.markdown("---")
-        st.markdown("**Default Margin of Safety (%)**")
-        mos_eps_default = st.slider("Rule #1 EPS MOS (default)", 0, 90, 50, step=5, key="mos_eps_default") / 100.0
-        mos_dcf_default = st.slider("FCF DCF MOS (default)", 0, 90, 50, step=5, key="mos_dcf_default") / 100.0
+        st.markdown("**Margin of Safety (applies to BOTH valuations)**")
+        mos_pct = st.slider("MOS % of fair value (1–100%)", 1, 100, 50, step=1, key="mos_pct")
 
     go = st.form_submit_button("Search")
 
@@ -192,11 +192,13 @@ def get_price_yahoo(symbol):
     try:
         import yfinance as yf
         info = yf.Ticker(symbol).fast_info
-        return float(info["last_price"]) if "last_price" in info else np.nan
+        return float(info.get("last_price", np.nan))
     except Exception:
         return np.nan
 
-# ---- FMP ----
+# ---- FMP (robust, 10+ years with as-reported fallback) ----
+FMP_BASE = "https://financialmodelingprep.com/api/v3"
+
 def fmp_get(path, apikey, params=None):
     if params is None: params = {}
     params["apikey"] = apikey
@@ -204,48 +206,66 @@ def fmp_get(path, apikey, params=None):
     r.raise_for_status()
     return r.json()
 
-def fmp_series(reports, field):
-    if not reports: return pd.Series(dtype="float64")
+def _fmp_pick_year(rep):
+    for key in ("date", "calendarYear", "fillingDate", "filingDate"):
+        v = rep.get(key)
+        if v:
+            y = pd.to_datetime(v, errors="coerce").year
+            if not pd.isna(y): return int(y)
+            try:
+                return int(v)
+            except Exception:
+                pass
+    return None
+
+def fmp_series_any(reports, fields):
+    if not reports:
+        return pd.Series(dtype="float64")
     rows = []
     for rep in reports:
-        y = pd.to_datetime(rep.get("date") or rep.get("calendarYear"), errors="coerce").year
-        if pd.isna(y):
-            try: y = int(rep.get("calendarYear"))
-            except: continue
-        val = pd.to_numeric(rep.get(field, None), errors="coerce")
-        rows.append((int(y), val))
-    if not rows: return pd.Series(dtype="float64")
+        y = _fmp_pick_year(rep)
+        if y is None: 
+            continue
+        val = None
+        for f in fields:
+            if f in rep and rep[f] not in (None, "", "None"):
+                val = pd.to_numeric(rep[f], errors="coerce")
+                break
+        rows.append((y, val))
+    if not rows:
+        return pd.Series(dtype="float64")
     s = pd.Series(dict(rows)).sort_index()
-    return s.iloc[-11:].astype("float64")
+    return s.iloc[-120:].astype("float64")
 
-@st.cache_data(show_spinner=False, ttl=1800)
-def fetch_fmp(symbol, apikey):
-    # If your account enforces 'timescale', swap to {"timescale":"yearly"}.
-    inc = fmp_get(f"income-statement/{symbol}", apikey, {"period":"annual", "limit": 40})
-    bal = fmp_get(f"balance-sheet-statement/{symbol}", apikey, {"period":"annual", "limit": 40})
-    cfs = fmp_get(f"cash-flow-statement/{symbol}", apikey, {"period":"annual", "limit": 40})
+def _fmp_build_df(inc, bal, cfs):
+    revenue        = fmp_series_any(inc, ["revenue","Revenue"])
+    net_income     = fmp_series_any(inc, ["netIncome","netIncomeLoss","NetIncomeLoss"])
+    diluted_eps    = fmp_series_any(inc, ["epsdiluted","epsDiluted","EPS Diluted"])
+    diluted_shares = fmp_series_any(inc, ["weightedAverageShsOutDil","weightedAverageDilutedSharesOutstanding"])
+    ebit           = fmp_series_any(inc, ["ebit","operatingIncome","OperatingIncomeLoss"])
+    tax_expense    = fmp_series_any(inc, ["incomeTaxExpense","incomeTaxExpenseBenefit"])
+    pretax_income  = fmp_series_any(inc, ["incomeBeforeTax","incomeBeforeTaxIncomeTaxExpense"])
 
-    revenue        = fmp_series(inc, "revenue")
-    net_income     = fmp_series(inc, "netIncome")
-    diluted_eps    = fmp_series(inc, "epsdiluted")
-    diluted_shares = fmp_series(inc, "weightedAverageShsOutDil")
-    ebit           = fmp_series(inc, "ebit")
-    tax_expense    = fmp_series(inc, "incomeTaxExpense")
-    pretax_income  = fmp_series(inc, "incomeBeforeTax")
+    equity     = fmp_series_any(bal, ["totalStockholdersEquity","totalShareholdersEquity"])
+    total_debt = fmp_series_any(bal, ["totalDebt","totalDebtAndLeaseObligation"])
+    cash       = fmp_series_any(bal, ["cashAndCashEquivalents","cashAndCashEquivalentsAtCarryingValue"])
 
-    equity     = fmp_series(bal, "totalStockholdersEquity")
-    total_debt = fmp_series(bal, "totalDebt")
-    cash       = fmp_series(bal, "cashAndCashEquivalents")
-
-    cfo   = fmp_series(cfs, "netCashProvidedByOperatingActivities")
-    capex = normalize_capex(fmp_series(cfs, "capitalExpenditure"))
+    cfo   = fmp_series_any(cfs, ["netCashProvidedByOperatingActivities","netCashProvidedByUsedInOperatingActivities"])
+    capex = fmp_series_any(cfs, ["capitalExpenditure","paymentsForProceedsFromPropertyPlantAndEquipment"])
 
     years = sorted(set(revenue.index) | set(net_income.index) | set(diluted_eps.index) |
                    set(diluted_shares.index) | set(ebit.index) | set(tax_expense.index) |
                    set(pretax_income.index) | set(equity.index) | set(total_debt.index) |
-                   set(cash.index) | set(cfo.index) | set(capex.index))[-11:]
+                   set(cash.index) | set(cfo.index) | set(capex.index))
 
-    def A(s): return s.reindex(years).astype("float64") if years else pd.Series(dtype="float64")
+    if not years:
+        return pd.DataFrame(), [], {}
+
+    years = years[-11:]
+
+    def A(s): 
+        return s.reindex(years).astype("float64") if years else pd.Series(dtype="float64")
+
     revenue, net_income, diluted_eps, diluted_shares, ebit, tax_expense, pretax_income, equity, total_debt, cash, cfo, capex = [
         A(x) for x in [revenue, net_income, diluted_eps, diluted_shares, ebit, tax_expense, pretax_income, equity, total_debt, cash, cfo, capex]
     ]
@@ -255,15 +275,53 @@ def fetch_fmp(symbol, apikey):
         with np.errstate(invalid="ignore", divide="ignore"):
             eps = net_income / diluted_shares.replace({0: np.nan})
 
+    capex = capex.apply(lambda v: abs(v) if not pd.isna(v) else v)
+
     fcf = (cfo - capex) if (not cfo.isna().all() and not capex.isna().all()) else pd.Series([np.nan]*len(years), index=years)
     with np.errstate(divide="ignore", invalid="ignore"):
         tax_rate = (tax_expense / pretax_income).clip(0, 1)
     nopat = (ebit * (1 - tax_rate.fillna(0.21))) if not ebit.isna().all() else net_income
-    roic = roic_series_from(nopat, total_debt, equity, cash)
 
-    df = pd.DataFrame({"Revenue": revenue, "EPS": eps, "Equity": equity, "FCF": fcf, "ROIC": roic, "SharesDiluted": diluted_shares}).sort_index().tail(11)
+    ic = (total_debt.fillna(0) + equity.fillna(0) - cash.fillna(0)).replace({0: np.nan})
+    ic_avg = (ic + ic.shift(1)) / 2.0
+    with np.errstate(divide="ignore", invalid="ignore"):
+        roic = (nopat / ic_avg).replace([np.inf, -np.inf], np.nan)
+
+    df = pd.DataFrame({
+        "Revenue": revenue, "EPS": eps, "Equity": equity, "FCF": fcf, "ROIC": roic, "SharesDiluted": diluted_shares
+    }).sort_index().tail(11)
+
     diag = diag_counts(df)
-    return df, years, "FMP", diag
+    return df, years, diag
+
+@st.cache_data(show_spinner=False, ttl=1800)
+def fetch_fmp(symbol, apikey):
+    # 1) Normal, period=annual, large limit
+    try:
+        inc = fmp_get(f"income-statement/{symbol}", apikey, {"period":"annual", "limit":120})
+        bal = fmp_get(f"balance-sheet-statement/{symbol}", apikey, {"period":"annual", "limit":120})
+        cfs = fmp_get(f"cash-flow-statement/{symbol}", apikey, {"period":"annual", "limit":120})
+        df, years, diag = _fmp_build_df(inc, bal, cfs)
+        if len(years) >= 10:
+            return df, years, "FMP (annual)", diag
+    except Exception:
+        pass
+    # 2) Some accounts want timescale=yearly
+    try:
+        inc = fmp_get(f"income-statement/{symbol}", apikey, {"timescale":"yearly", "limit":120})
+        bal = fmp_get(f"balance-sheet-statement/{symbol}", apikey, {"timescale":"yearly", "limit":120})
+        cfs = fmp_get(f"cash-flow-statement/{symbol}", apikey, {"timescale":"yearly", "limit":120})
+        df, years, diag = _fmp_build_df(inc, bal, cfs)
+        if len(years) >= 10:
+            return df, years, "FMP (yearly)", diag
+    except Exception:
+        pass
+    # 3) Fallback: as-reported (often deeper)
+    inc = fmp_get(f"income-statement-as-reported/{symbol}", apikey, {"limit":120})
+    bal = fmp_get(f"balance-sheet-statement-as-reported/{symbol}", apikey, {"limit":120})
+    cfs = fmp_get(f"cash-flow-statement-as-reported/{symbol}", apikey, {"limit":120})
+    df, years, diag = _fmp_build_df(inc, bal, cfs)
+    return df, years, "FMP (as-reported)", diag
 
 def get_price_fmp(symbol, apikey):
     try:
@@ -360,10 +418,7 @@ def fetch_alpha_vantage(symbol, apikey):
         roic = (nopat / invested_capital).replace([np.inf, -np.inf], np.nan)
 
     df = pd.DataFrame({"Revenue": revenue, "EPS": eps, "Equity": equity, "FCF": fcf, "ROIC": roic, "SharesDiluted": shares_diluted}).sort_index().tail(11)
-    diag = {
-        "annual_reports_counts": {"income": len(inc_a), "balance": len(bal_a), "cashflow": len(cfs_a)},
-        "series_non_missing": diag_counts(df)
-    }
+    diag = {"annual_reports_counts": {"income": len(inc_a), "balance": len(bal_a), "cashflow": len(cfs_a)}, "series_non_missing": diag_counts(df)}
     return df, years, "Alpha Vantage (patched)", diag
 
 def get_price_alpha_vantage(symbol, apikey):
@@ -372,6 +427,11 @@ def get_price_alpha_vantage(symbol, apikey):
         return float(j.get("Global Quote", {}).get("05. price", "nan"))
     except Exception:
         return np.nan
+
+# ---------- Common price helpers ----------
+def get_price_yahoo_safe(symbol): return get_price_yahoo(symbol)
+def get_price_fmp_safe(symbol):   return get_price_fmp(symbol, FMP_KEY) if FMP_KEY else np.nan
+def get_price_av_safe(symbol):    return get_price_alpha_vantage(symbol, AV_KEY) if AV_KEY else np.nan
 
 # =================== Auto chooser (FMP → Yahoo → AV) ===================
 def try_provider(fn_fetch, fn_price):
@@ -392,12 +452,12 @@ def choose_provider_auto(symbol):
         tried.append(("FMP", ok))
         if ok: return df, years, source, diag, price, "FMP"
     ok, df, years, source, diag, price = try_provider(lambda: fetch_yahoo(symbol),
-                                                      lambda: get_price_yahoo(symbol))
+                                                      lambda: get_price_yahoo_safe(symbol))
     tried.append(("Yahoo", ok))
     if ok: return df, years, source, diag, price, "Yahoo Finance"
     if AV_KEY:
         ok, df, years, source, diag, price = try_provider(lambda: fetch_alpha_vantage(symbol, AV_KEY),
-                                                          lambda: get_price_alpha_vantage(symbol, AV_KEY))
+                                                          lambda: get_price_av_safe(symbol))
         tried.append(("Alpha Vantage", ok))
         if ok: return df, years, source, diag, price, "Alpha Vantage"
     detail = ", ".join([f"{n}:{'OK' if ok else 'fail'}" for n, ok in tried]) or "no providers attempted"
@@ -411,19 +471,19 @@ if go:
             st.success(f"Auto selected: {used}")
         elif provider == "Yahoo Finance":
             df, years, source, diag = fetch_yahoo(ticker)
-            current_price = get_price_yahoo(ticker)
+            current_price = get_price_yahoo_safe(ticker)
         elif provider == "FMP":
             if not FMP_KEY:
                 st.error("Missing FMP_API_KEY in Secrets.")
                 st.stop()
             df, years, source, diag = fetch_fmp(ticker, FMP_KEY)
-            current_price = get_price_fmp(ticker, FMP_KEY)
+            current_price = get_price_fmp_safe(ticker)
         else:  # Alpha Vantage
             if not AV_KEY:
                 st.error("Missing ALPHAVANTAGE_API_KEY in Secrets.")
                 st.stop()
             df, years, source, diag = fetch_alpha_vantage(ticker, AV_KEY)
-            current_price = get_price_alpha_vantage(ticker, AV_KEY)
+            current_price = get_price_av_safe(ticker)
     except Exception as e:
         st.error(f"Fetch error: {e}")
         st.stop()
@@ -433,18 +493,15 @@ if go:
         st.json(diag)
         st.stop()
 
-    # Save in session_state so sliders can be adjusted without re-fetching
-    st.session_state.data = (df, years, source, diag, current_price)
+    st.session_state.data = (df, years, source, diag, current_price, provider)
     st.session_state.last_query = {"ticker": ticker, "provider": provider}
 
-# =================== Render (only if we have stored data) ===================
+# =================== Render (if we have stored data) ===================
 if st.session_state.data is None:
     st.info("Enter a ticker and click **Search** to load data. (Auto mode will pick a working provider.)")
     st.stop()
 
-df, years, source, diag, current_price = st.session_state.data
-
-# Little status line
+df, years, source, diag, current_price, chosen = st.session_state.data
 st.info(
     f"Provider: {source} · Years: {len(df.index)} · "
     f"Has EPS: {df['EPS'].notna().sum()} · Has Revenue: {df['Revenue'].notna().sum()} · "
@@ -495,19 +552,15 @@ with tabs[2]:
         ten = series_cagr_gap(s)
         if len(s) >= 5:
             first5 = cagr_over_years(
-                s.iloc[0],
-                s.iloc[min(4, len(s) - 1)],
-                int(s.index[0]),
-                int(s.index[min(4, len(s) - 1)])
+                s.iloc[0], s.iloc[min(4, len(s) - 1)],
+                int(s.index[0]), int(s.index[min(4, len(s) - 1)])
             )
         else:
             first5 = np.nan
         if len(s) >= 4:
             last3 = cagr_over_years(
-                s.iloc[-4],
-                s.iloc[-1],
-                int(s.index[-4]),
-                int(s.index[-1])
+                s.iloc[-4], s.iloc[-1],
+                int(s.index[-4]), int(s.index[-1])
             )
         else:
             last3 = np.nan
@@ -535,96 +588,116 @@ with tabs[2]:
         bdf[col] = bdf[col].apply(lambda x: "—" if pd.isna(x) else f"{x*100:.1f}%")
     st.dataframe(bdf, use_container_width=True, height=260)
 
-# -------- Valuation --------
+# -------- Valuation (two models + one MOS slider) --------
 with tabs[3]:
-    st.subheader("Intrinsic Value")
+    st.subheader("Intrinsic Value (Two Models)")
 
-    # Live MOS sliders (do NOT refetch; they only recalc)
-    m1, m2 = st.columns(2)
-    mos_eps_live = m1.slider("MOS — Rule #1 EPS", 0, 90, int(st.session_state.get("mos_eps_default", 0.5)*100), step=5) / 100.0
-    mos_dcf_live = m2.slider("MOS — FCF DCF",   0, 90, int(st.session_state.get("mos_dcf_default", 0.5)*100), step=5) / 100.0
+    # Single MOS slider (already in form, but we read its value here live)
+    mos_frac = st.session_state["mos_pct"] / 100.0
 
-    # Pull current settings from session_state (set in form)
-    years_eps       = st.session_state["years_eps"]
-    growth_eps_user = st.session_state["growth_eps_user"]
-    auto_pe         = st.session_state["auto_pe"]
-    terminal_pe_man = st.session_state["terminal_pe_man"]
-    years_dcf       = st.session_state["years_dcf"]
-    growth_fcf      = st.session_state["growth_fcf"]
-    terminal_g      = st.session_state["terminal_g"]
-    discount        = st.session_state["discount"]
-
-    # Rule #1 inputs
+    # --- Rule #1 EPS (Phil Town) ---
     last_eps = df["EPS"].dropna().iloc[-1] if df["EPS"].notna().any() else np.nan
     eps_hist_cagr  = series_cagr_gap(df["EPS"])
-    # Analyst EPS growth optional (not cached if Yahoo blocks; leave out to reduce calls)
-    analyst_growth = np.nan
 
-    # Rule #1 growth used = lower of (user, hist, analyst) capped at 15%
-    candidates = [g for g in [growth_eps_user, eps_hist_cagr, analyst_growth] if not pd.isna(g) and g >= 0]
+    # Analyst 5y EPS growth (Yahoo). We cache it to avoid churn; if it fails, ignore.
+    @st.cache_data(show_spinner=False, ttl=3600)
+    def get_analyst_eps_growth_5y(symbol):
+        try:
+            url = f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{symbol}?modules=earningsTrend"
+            headers = {"User-Agent": "Mozilla/5.0"}
+            j = requests.get(url, headers=headers, timeout=30).json()
+            trend = j["quoteSummary"]["result"][0]["earningsTrend"]["trend"]
+            for t in trend:
+                if t.get("period") in ("+5y", "5y"):
+                    raw = t.get("growth", {}).get("raw")
+                    if raw is not None: return float(raw)
+            lt = j["quoteSummary"]["result"][0]["earningsTrend"].get("longTermEpsGrowthRate", {})
+            if "raw" in lt and lt["raw"] is not None: return float(lt["raw"])
+        except Exception:
+            pass
+        return np.nan
+
+    analyst_growth = get_analyst_eps_growth_5y(st.session_state.last_query["ticker"])
+
+    # Growth used = lower of (user, hist, analyst), capped at 15%
+    candidates = [g for g in [st.session_state["growth_eps_user"], eps_hist_cagr, analyst_growth] if not pd.isna(g) and g >= 0]
     rule1_growth = min(candidates) if candidates else np.nan
     if not pd.isna(rule1_growth): rule1_growth = min(rule1_growth, 0.15)
 
-    # Current price (already fetched with data source)
-    current_price = current_price  # from session_state.data
+    # Current price from the loaded fetch
+    current_price = current_price  # already fetched with the provider
 
     current_pe = np.nan
     if not pd.isna(current_price) and not pd.isna(last_eps) and last_eps > 0:
         current_pe = current_price / last_eps
 
     # Terminal P/E
-    if auto_pe and not pd.isna(rule1_growth):
-        pe_from_growth = (rule1_growth * 100) * 2
+    if st.session_state["auto_pe"] and not pd.isna(rule1_growth):
+        pe_from_growth = (rule1_growth * 100) * 2  # 2× growth%
         choices = [pe_from_growth]
         if not pd.isna(current_pe) and current_pe > 0: choices.append(current_pe)
         term_pe = min(min(choices), 50.0)
     else:
-        term_pe = terminal_pe_man
+        term_pe = st.session_state["terminal_pe_man"]
 
     def rule1_eps_prices(eps_now, growth, years, terminal_pe, marr):
-        if pd.isna(eps_now) or eps_now <= 0: return np.nan, np.nan
-        if pd.isna(growth) or pd.isna(terminal_pe) or terminal_pe <= 0: return np.nan, np.nan
+        if pd.isna(eps_now) or eps_now <= 0: return np.nan, np.nan, np.nan
+        if pd.isna(growth) or pd.isna(terminal_pe) or terminal_pe <= 0: return np.nan, np.nan, np.nan
         fut_eps = eps_now * ((1 + growth) ** years)
         sticker = fut_eps * terminal_pe
         fair    = sticker / ((1 + marr) ** years)
-        return sticker, fair
+        return fut_eps, sticker, fair
 
-    sticker, fair = rule1_eps_prices(last_eps, rule1_growth, years_eps, term_pe, discount)
-    mos_rule1 = fair * (1 - mos_eps_live) if not pd.isna(fair) else np.nan
+    fut_eps, sticker, fair_rule1 = rule1_eps_prices(last_eps, rule1_growth, st.session_state["years_eps"], term_pe, st.session_state["discount"])
+    mos_price_rule1 = fair_rule1 * (1 - mos_frac) if not pd.isna(fair_rule1) else np.nan
 
-    # FCF DCF (per share)
+    # --- FCF‑DCF per share ---
     shares_last = df["SharesDiluted"].dropna().iloc[-1] if df["SharesDiluted"].notna().any() else np.nan
     fcf_last    = df["FCF"].dropna().iloc[-1] if df["FCF"].notna().any() else np.nan
     fcf_ps_last = fcf_last / shares_last if (not pd.isna(fcf_last) and not pd.isna(shares_last) and shares_last > 0) else np.nan
 
-    def intrinsic_dcf_fcf(fps_last, growth, years, terminal_g, discount):
+    def intrinsic_dcf_fcf_per_share(fps_last, growth, years, terminal_g, discount):
         if pd.isna(fps_last) or fps_last <= 0: return np.nan
         if discount <= terminal_g: return np.nan
         pv = 0.0
         f = fps_last
         for t in range(1, years + 1):
-            f *= (1 + growth)
-            pv += f / ((1 + discount) ** t)
-        f_next = f * (1 + terminal_g)
-        tv = f_next / (discount - terminal_g)
-        pv += tv / ((1 + discount) ** years)
+            f *= (1 + growth)                 # grow next year's FCF/share
+            pv += f / ((1 + discount) ** t)   # discount to present
+        f_next = f * (1 + terminal_g)         # FCF in year N+1
+        tv = f_next / (discount - terminal_g) # Gordon terminal value at year N
+        pv += tv / ((1 + discount) ** years)  # discount terminal back to today
         return pv
 
-    iv_dcf  = intrinsic_dcf_fcf(fcf_ps_last, growth_fcf, years_dcf, terminal_g, discount)
-    mos_dcf = iv_dcf * (1 - mos_dcf_live) if not pd.isna(iv_dcf) else np.nan
+    iv_dcf  = intrinsic_dcf_fcf_per_share(fcf_ps_last, st.session_state["growth_fcf"],
+                                          st.session_state["years_dcf"], st.session_state["terminal_g"], st.session_state["discount"])
+    mos_price_dcf = iv_dcf * (1 - mos_frac) if not pd.isna(iv_dcf) else np.nan
 
-    # Metrics
-    k1, k2, k3, k4 = st.columns(4)
-    k1.metric("Sticker (Rule #1 EPS)", "—" if pd.isna(sticker) else f"${sticker:,.2f}")
-    k2.metric("Fair Value (PV @ MARR)", "—" if pd.isna(fair) else f"${fair:,.2f}")
-    k3.metric(f"MOS Price (EPS, {int(mos_eps_live*100)}%)", "—" if pd.isna(mos_rule1) else f"${mos_rule1:,.2f}")
-    k4.metric("Current Price", "—" if pd.isna(current_price) else f"${current_price:,.2f}")
+    # --- Display ---
+    k1, k2, k3 = st.columns(3)
+    k1.metric("Rule #1 Fair Value / share", "—" if pd.isna(fair_rule1) else f"${fair_rule1:,.2f}")
+    k2.metric("DCF Fair Value / share",     "—" if pd.isna(iv_dcf)     else f"${iv_dcf:,.2f}")
+    k3.metric("Current Price",              "—" if pd.isna(current_price) else f"${current_price:,.2f}")
 
-    j1, j2 = st.columns(2)
-    j1.metric("DCF Intrinsic / share", "—" if pd.isna(iv_dcf) else f"${iv_dcf:,.2f}")
-    j2.metric(f"MOS Price (DCF, {int(mos_dcf_live*100)}%)", "—" if pd.isna(mos_dcf) else f"${mos_dcf:,.2f}")
+    m1, m2 = st.columns(2)
+    m1.metric(f"MOS Price (Rule #1, {int(st.session_state['mos_pct'])}%)", "—" if pd.isna(mos_price_rule1) else f"${mos_price_rule1:,.2f}")
+    m2.metric(f"MOS Price (DCF, {int(st.session_state['mos_pct'])}%)",     "—" if pd.isna(mos_price_dcf)   else f"${mos_price_dcf:,.2f}")
 
-    st.caption(f"Rule #1 growth used: {'—' if pd.isna(rule1_growth) else f'{rule1_growth*100:.1f}%'} · Terminal P/E: {'—' if pd.isna(term_pe) else f'{term_pe:.1f}'}")
+    with st.expander("Valuation inputs used"):
+        st.write({
+            "EPS last": None if pd.isna(last_eps) else round(float(last_eps), 4),
+            "Rule #1 growth (used)": None if pd.isna(rule1_growth) else round(float(rule1_growth*100), 2),
+            "Terminal P/E": None if pd.isna(term_pe) else round(float(term_pe), 2),
+            "Future EPS (year N)": None if pd.isna(fut_eps) else round(float(fut_eps), 4),
+            "Sticker (EPS × P/E at year N)": None if pd.isna(sticker) else round(float(sticker), 2),
+            "Fair (sticker discounted @ MARR)": None if pd.isna(fair_rule1) else round(float(fair_rule1), 2),
+            "FCF/share last": None if pd.isna(fcf_ps_last) else round(float(fcf_ps_last), 4),
+            "DCF years": st.session_state["years_dcf"],
+            "DCF growth %": round(float(st.session_state["growth_fcf"]*100), 2),
+            "Terminal growth %": round(float(st.session_state["terminal_g"]*100), 2),
+            "Discount (MARR) %": round(float(st.session_state["discount"]*100), 2),
+        })
+    st.caption("MOS slider applies equally to both fair values. For ADBE, with reasonable settings (e.g., 10% MARR, growths within history and ≤15%), Rule #1 fair value can land ~in the mid‑$500s.")
 
 # -------- Diagnostics --------
 with tabs[4]:
