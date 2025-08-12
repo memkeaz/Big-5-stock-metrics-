@@ -369,9 +369,17 @@ if run:
     for col in ["10yr","First 5yr","Last 3yr","Last 1yr"]:
         breakdown_fmt[col] = breakdown_fmt[col].apply(lambda v: "—" if pd.isna(v) else f"{v*100:.1f}%")
 
-    st.markdown("### Metric Breakdown (10 / First-5 / Last-3 / Last-1)")
-    st.dataframe(breakdown_fmt, use_container_width=True)
-    st.caption("Growth rows show CAGR; 'Last 1yr' is YoY. ROIC rows show averages; 'Last 1yr' is the most recent ROIC.")
+ st.markdown("### Metric Breakdown (10 / First-5 / Last-3 / Last-1)")
+st.dataframe(breakdown_fmt, use_container_width=True)
+
+# Footer with Rule #1 inputs that were actually used in EPS model
+rule1_growth_text = "—" if pd.isna(rule1_growth) else f"{rule1_growth*100:.1f}%"
+term_pe_text = "—" if pd.isna(term_pe) else f"{term_pe:.1f}"
+
+st.caption(
+    "Growth rows show CAGR; 'Last 1yr' is YoY. ROIC rows show averages; 'Last 1yr' is the most recent ROIC.  \n"
+    f"**Rule #1 EPS settings used:** Growth = {rule1_growth_text} · Terminal P/E = {term_pe_text}."
+)
 
     # -------------------- Data Coverage --------------------
     st.markdown("#### Data Coverage (non-missing values used)")
