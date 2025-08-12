@@ -1,3 +1,4 @@
+from __future__ import annotations
 # ---------- Alpha Vantage (patched + clearer errors) ----------
 AV_BASE  = "https://www.alphavantage.co/query"
 
