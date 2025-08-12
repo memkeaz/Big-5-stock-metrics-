@@ -6,7 +6,7 @@ import requests
 # =================== Page ===================
 st.set_page_config(page_title="Phil Town Big 5 Screener", layout="wide")
 st.title("Phil Town Big 5 — 10-Year Screener")
-st.caption("Big 5 (Sales, EPS, Equity, FCF CAGR + 10-yr Avg ROIC), 10/5/3/1 breakdowns, Rule #1 EPS & FCF DCF valuations with custom MOS sliders, and a Value-Investor summary.")
+st.caption("Big 5 (Sales, EPS, Equity, FCF CAGR + 10-yr Avg ROIC), 10/5/3/1 breakdowns, Rule #1 EPS & FCF DCF valuations with live MOS sliders, and a Value-Investor summary.")
 
 # =================== Top controls ===================
 c1, c2 = st.columns([3,1])
@@ -28,7 +28,7 @@ FMP_KEY = st.secrets.get("FMP_API_KEY", "").strip()
 OPENAI_KEY = st.secrets.get("OPENAI_API_KEY", "").strip()
 
 st.sidebar.markdown("### Valuation Assumptions")
-# Rule #1 EPS — you provide an estimate; app uses LOWER of (this, 10y EPS CAGR, analyst 5y EPS growth), capped at 15%
+# Rule #1 EPS — app uses LOWER of (your estimate, 10y EPS CAGR, analyst 5y EPS growth), capped at 15%
 years_eps = 10  # Rule #1 standard
 growth_eps_user = st.sidebar.number_input("Your EPS growth estimate (annual, %)", 0.0, 50.0, 12.0, step=0.5) / 100.0
 auto_pe = st.sidebar.checkbox("Terminal P/E ≈ lower of (2× growth, current P/E), capped at 50", value=True)
@@ -42,10 +42,10 @@ terminal_g = st.sidebar.number_input("Terminal growth (FCF, %)", 0.0, 6.0, 3.0, 
 # Discount (MARR)
 discount = st.sidebar.number_input("MARR / Discount rate (%, both models)", 4.0, 20.0, 10.0, step=0.5) / 100.0
 
-# Per-valuation Margin of Safety sliders (as % off fair value)
-st.sidebar.markdown("### Margin of Safety sliders")
-mos_eps_pct = st.sidebar.slider("MOS for Rule #1 EPS (%)", 0, 90, 50, step=5) / 100.0
-mos_dcf_pct = st.sidebar.slider("MOS for FCF DCF (%)", 0, 90, 40, step=5) / 100.0
+# Default MOS in sidebar (used to prefill live sliders)
+st.sidebar.markdown("### Default MOS (prefill for live sliders)")
+mos_eps_pct_default = st.sidebar.slider("Default MOS for Rule #1 EPS (%)", 0, 90, 50, step=5) / 100.0
+mos_dcf_pct_default = st.sidebar.slider("Default MOS for FCF DCF (%)", 0, 90, 50, step=5) / 100.0
 
 # =================== Demo ===================
 def demo_msft_df():
@@ -264,13 +264,11 @@ def get_analyst_eps_growth_5y(symbol: str) -> float:
         headers = {"User-Agent": "Mozilla/5.0"}
         j = requests.get(url, headers=headers, timeout=30).json()
         trend = j["quoteSummary"]["result"][0]["earningsTrend"]["trend"]
-        # Look for "+5y" period or "longTermEpsGrowthRate"
         for t in trend:
             if t.get("period") in ("+5y", "5y"):
                 val = t.get("growth", {}).get("raw")
                 if val is not None:
-                    return float(val)  # already decimal (e.g., 0.12)
-        # fallback: sometimes stored as longTermEpsGrowthRate
+                    return float(val)  # decimal (e.g., 0.12)
         lt = j["quoteSummary"]["result"][0]["earningsTrend"].get("longTermEpsGrowthRate", {})
         if "raw" in lt and lt["raw"] is not None:
             return float(lt["raw"])
@@ -394,17 +392,21 @@ if run:
     st.markdown("### Metric Breakdown (10 / First-5 / Last-3 / Last-1)")
     st.dataframe(breakdown_fmt, use_container_width=True)
 
-    # ===== Footer shows Rule #1 inputs actually used =====
-    # We'll compute them below first, then display a caption afterward.
-
     # ---------- Data Coverage ----------
     st.markdown("#### Data Coverage (non-missing values used)")
     coverage = df.notna().sum().rename("Valid Years").to_frame()
     coverage["Out of"] = len(df.index)
     st.dataframe(coverage.T, use_container_width=True)
 
-    # ---------- Rule #1 EPS valuation ----------
+    # ---------- Intrinsic Value ----------
     st.markdown("### Intrinsic Value")
+
+    # Live MOS sliders (override the sidebar defaults)
+    mos_cols = st.columns(2)
+    with mos_cols[0]:
+        mos_eps_live = st.slider("Adjust MOS for Rule #1 EPS (%)", 0, 90, int(mos_eps_pct_default * 100), step=5, key="mos_eps_live") / 100.0
+    with mos_cols[1]:
+        mos_dcf_live = st.slider("Adjust MOS for FCF DCF (%)", 0, 90, int(mos_dcf_pct_default * 100), step=5, key="mos_dcf_live") / 100.0
 
     # Current EPS (last annual)
     last_eps = df["EPS"].dropna().iloc[-1] if df["EPS"].notna().any() else np.nan
@@ -442,40 +444,41 @@ if run:
     else:
         term_pe = terminal_pe_manual
 
+    # Rule #1 EPS: Sticker -> PV@MARR -> MOS (live)
     def rule1_eps_to_prices(eps_now, growth, years, terminal_pe, marr):
-        if pd.isna(eps_now) or eps_now <= 0: return np.nan, np.nan, np.nan
-        if pd.isna(growth) or growth < 0: return np.nan, np.nan, np.nan
-        if pd.isna(terminal_pe) or terminal_pe <= 0: return np.nan, np.nan, np.nan
+        if pd.isna(eps_now) or eps_now <= 0: return np.nan, np.nan
+        if pd.isna(growth) or growth < 0: return np.nan, np.nan
+        if pd.isna(terminal_pe) or terminal_pe <= 0: return np.nan, np.nan
         fut_eps = eps_now * ((1 + growth) ** years)
         sticker = fut_eps * terminal_pe
         fair = sticker / ((1 + marr) ** years)
-        mos = fair * (1.0 - mos_eps_pct)  # custom MOS slider for EPS
-        return sticker, fair, mos
+        return sticker, fair
 
-    sticker_price, fair_value, mos_price_rule1 = rule1_eps_to_prices(last_eps, rule1_growth, years_eps, term_pe, discount)
+    sticker_price, fair_value = rule1_eps_to_prices(last_eps, rule1_growth, years_eps, term_pe, discount)
+    mos_price_rule1 = fair_value * (1.0 - mos_eps_live) if not pd.isna(fair_value) else np.nan
 
-    # ---------- FCF DCF ----------
+    # FCF DCF (per-share)
     shares_last = df["SharesDiluted"].dropna().iloc[-1] if "SharesDiluted" in df and df["SharesDiluted"].notna().any() else np.nan
     fcf_last = df["FCF"].dropna().iloc[-1] if df["FCF"].notna().any() else np.nan
     fcf_per_share_last = (fcf_last / shares_last) if (not pd.isna(fcf_last) and not pd.isna(shares_last) and shares_last > 0) else np.nan
 
     iv_dcf = intrinsic_dcf_fcf(fcf_per_share_last, growth_fcf, years_dcf, terminal_g, discount)
-    mos_price_dcf = iv_dcf * (1.0 - mos_dcf_pct) if not pd.isna(iv_dcf) else np.nan
+    mos_price_dcf = iv_dcf * (1.0 - mos_dcf_live) if not pd.isna(iv_dcf) else np.nan
 
-    # ---------- Display valuations ----------
+    # Display valuations
     colv1, colv2, colv3, colv4 = st.columns(4)
     colv1.metric("Sticker Price (Rule #1 EPS)", f"${sticker_price:,.2f}" if not pd.isna(sticker_price) else "—")
     colv2.metric("Fair Value (PV @ MARR)", f"${fair_value:,.2f}" if not pd.isna(fair_value) else "—")
-    colv3.metric(f"MOS Price (EPS, {int(mos_eps_pct*100)}%)", f"${mos_price_rule1:,.2f}" if not pd.isna(mos_price_rule1) else "—")
+    colv3.metric(f"MOS Price (EPS, {int(mos_eps_live*100)}%)", f"${mos_price_rule1:,.2f}" if not pd.isna(mos_price_rule1) else "—")
     colv4.metric("Current Price", f"${current_price:,.2f}" if not pd.isna(current_price) else "—")
 
     colv5, colv6, colv7, colv8 = st.columns(4)
     colv5.metric("Rule #1 Growth Used", "—" if pd.isna(rule1_growth) else f"{rule1_growth*100:.1f}%")
     colv6.metric("Terminal P/E Used", "—" if pd.isna(term_pe) else f"{term_pe:.1f}")
     colv7.metric("DCF Intrinsic / sh.", f"${iv_dcf:,.2f}" if not pd.isna(iv_dcf) else "—")
-    colv8.metric(f"MOS Price (DCF, {int(mos_dcf_pct*100)}%)", f"${mos_price_dcf:,.2f}" if not pd.isna(mos_price_dcf) else "—")
+    colv8.metric(f"MOS Price (DCF, {int(mos_dcf_live*100)}%)", f"${mos_price_dcf:,.2f}" if not pd.isna(mos_price_dcf) else "—")
 
-    # Add caption under Metric Breakdown now that we know the chosen Rule #1 inputs
+    # Helpful caption tying back to Rule #1 choices
     rule1_growth_text = "—" if pd.isna(rule1_growth) else f"{rule1_growth*100:.1f}%"
     term_pe_text = "—" if pd.isna(term_pe) else f"{term_pe:.1f}"
     st.caption(
@@ -483,7 +486,7 @@ if run:
         f"**Rule #1 EPS settings used:** Growth = {rule1_growth_text} · Terminal P/E = {term_pe_text}."
     )
 
-    # ---------- Optional: Value-Investor Summary ----------
+    # ---------- Value-Investor Summary (OpenAI) ----------
     st.markdown("### Value-Investor Summary (OpenAI)")
     if not OPENAI_KEY:
         st.info("Add **OPENAI_API_KEY** in Secrets to enable the summary.")
@@ -549,3 +552,4 @@ if run:
 
 else:
     st.info("Enter a ticker and click **Search**. Choose provider in the sidebar and confirm your API key in Secrets.")
+
