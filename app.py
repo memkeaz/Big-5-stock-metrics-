@@ -7,7 +7,7 @@ from typing import Tuple, List
 # -------------------- Page Config --------------------
 st.set_page_config(page_title="Phil Town Big 5 Screener", layout="wide")
 st.title("Phil Town Big 5 — 10-Year Screener")
-st.caption("Big 5 (Sales, EPS, Equity, FCF CAGR + 10-yr Avg ROIC), full 10/5/3/1 breakdowns, Intrinsic Value (EPS & FCF DCF), and a Value-Investor summary.")
+st.caption("Big 5 (Sales, EPS, Equity, FCF CAGR + 10-yr Avg ROIC), full 10/5/3/1 breakdowns, Intrinsic Value (Rule #1 EPS & FCF DCF), and a Value-Investor summary.")
 
 # -------------------- Cache Control --------------------
 scol1, scol2 = st.columns([3, 1])
@@ -28,23 +28,20 @@ AV_KEY = st.secrets.get("ALPHAVANTAGE_API_KEY", "").strip()
 FMP_KEY = st.secrets.get("FMP_API_KEY", "").strip()
 OPENAI_KEY = st.secrets.get("OPENAI_API_KEY", "").strip()
 
-# ---------- Valuation assumptions (with your defaults) ----------
+# ---------- Valuation assumptions (your defaults) ----------
 st.sidebar.markdown("### Valuation Assumptions")
-# EPS (P/E) model
-years_eps = st.sidebar.slider("Years (EPS model)", 5, 15, 10)
-growth_eps = st.sidebar.number_input("EPS growth (annual, %)", 0.0, 50.0, 12.0, step=0.5) / 100.0
-auto_pe = st.sidebar.checkbox("Auto terminal P/E ≈ 2× growth (cap 50, floor 8)", value=True)
-terminal_pe_input = st.sidebar.number_input("Terminal P/E (override when Auto off)", 5.0, 60.0, 20.0, step=0.5)
+# EPS (Rule #1) model — you provide an EPS growth guess; app uses LOWER of this and historical EPS CAGR, capped at 15%
+years_eps = 10  # Rule #1 standard horizon
+growth_eps_user = st.sidebar.number_input("Your EPS growth estimate (annual, %)", 0.0, 50.0, 12.0, step=0.5) / 100.0
+auto_pe = st.sidebar.checkbox("Terminal P/E ≈ lower of (2× growth, current P/E), capped at 50", value=True)
+terminal_pe_manual = st.sidebar.number_input("Terminal P/E (manual override if Auto off)", 5.0, 60.0, 20.0, step=0.5)
+
 # FCF DCF model
 years_dcf = st.sidebar.slider("Years (FCF DCF)", 5, 15, 10)
 growth_fcf = st.sidebar.number_input("FCF growth (annual, %)", 0.0, 50.0, 10.0, step=0.5) / 100.0
 terminal_g = st.sidebar.number_input("Terminal growth (FCF, %)", 0.0, 6.0, 3.0, step=0.25) / 100.0
 # Discount rate (default 10%)
-discount = st.sidebar.number_input("Discount rate (both models, %)", 4.0, 20.0, 10.0, step=0.5) / 100.0
-
-def terminal_pe_from_growth(g):
-    return max(8.0, min(50.0, (g * 100.0) * 2.0))
-terminal_pe = terminal_pe_from_growth(growth_eps) if auto_pe else terminal_pe_input
+discount = st.sidebar.number_input("MARR / Discount rate (%, both models)", 4.0, 20.0, 10.0, step=0.5) / 100.0
 
 # -------------------- Demo Mode --------------------
 def demo_msft_df():
@@ -259,14 +256,7 @@ def get_price_fmp(symbol: str, apikey: str) -> float:
     except Exception:
         return np.nan
 
-# -------------------- Intrinsic Value Models --------------------
-def intrinsic_eps_model(eps_last: float, growth: float, years: int, terminal_pe: float, discount: float) -> float:
-    if pd.isna(eps_last) or eps_last <= 0: return np.nan
-    eps_future = eps_last * ((1 + growth) ** years)
-    future_price = eps_future * terminal_pe
-    intrinsic_now = future_price / ((1 + discount) ** years)
-    return intrinsic_now
-
+# -------------------- Intrinsic Value (FCF DCF) --------------------
 def intrinsic_dcf_fcf(fcf_per_share_last: float, growth: float, years: int, terminal_g: float, discount: float) -> float:
     if pd.isna(fcf_per_share_last) or fcf_per_share_last <= 0: return np.nan
     if discount <= terminal_g: return np.nan
@@ -335,7 +325,6 @@ if run:
     st.dataframe(big5, use_container_width=True)
 
     # -------------------- Metric Breakdown (10 / First-5 / Last-3 / Last-1) --------------------
-    # For growth metrics (Sales/EPS/Equity/FCF): use CAGR windows; Last-1 is YoY
     def breakdown_growth(s: pd.Series):
         s = s.dropna()
         if len(s) < 2:
@@ -352,7 +341,6 @@ if run:
         last1 = yoy(s)
         return ten, first5, last3, last1
 
-    # For ROIC: use averages (Last-1 is the last ROIC)
     def breakdown_roic(s: pd.Series):
         s = s.replace([np.inf, -np.inf], np.nan).dropna()
         if len(s) == 0:
@@ -363,7 +351,6 @@ if run:
         last1 = s.iloc[-1]
         return ten, first5, last3, last1
 
-    # Compute all rows
     sales_b = breakdown_growth(df["Revenue"])
     eps_b   = breakdown_growth(df["EPS"])
     eqty_b  = breakdown_growth(df["Equity"])
@@ -382,8 +369,9 @@ if run:
     for col in ["10yr","First 5yr","Last 3yr","Last 1yr"]:
         breakdown_fmt[col] = breakdown_fmt[col].apply(lambda v: "—" if pd.isna(v) else f"{v*100:.1f}%")
 
-    st.markdown("### Metric Breakdown (10 / First‑5 / Last‑3 / Last‑1)")
+    st.markdown("### Metric Breakdown (10 / First-5 / Last-3 / Last-1)")
     st.dataframe(breakdown_fmt, use_container_width=True)
+    st.caption("Growth rows show CAGR; 'Last 1yr' is YoY. ROIC rows show averages; 'Last 1yr' is the most recent ROIC.")
 
     # -------------------- Data Coverage --------------------
     st.markdown("#### Data Coverage (non-missing values used)")
@@ -393,43 +381,96 @@ if run:
 
     # -------------------- Intrinsic Value --------------------
     st.markdown("### Intrinsic Value")
+
+    # Current EPS (last annual EPS from the series)
     last_eps = df["EPS"].dropna().iloc[-1] if df["EPS"].notna().any() else np.nan
 
-    shares_last = df["SharesDiluted"].dropna().iloc[-1] if "SharesDiluted" in df and df["SharesDiluted"].notna().any() else np.nan
-    fcf_last = df["FCF"].dropna().iloc[-1] if df["FCF"].notna().any() else np.nan
-    fcf_per_share_last = (fcf_last / shares_last) if (not pd.isna(fcf_last) and not pd.isna(shares_last) and shares_last > 0) else np.nan
+    # Historical EPS CAGR (10y)
+    eps_hist_cagr = eps_cagr_10  # from above calculation
 
-    iv_eps = intrinsic_eps_model(last_eps, growth_eps, years_eps, terminal_pe, discount)
-    iv_dcf = intrinsic_dcf_fcf(fcf_per_share_last, growth_fcf, years_dcf, terminal_g, discount)
+    # Rule #1 growth rate: lower of user estimate and historical CAGR; cap at 15%
+    candidates = [g for g in [growth_eps_user, eps_hist_cagr] if not pd.isna(g) and g >= 0]
+    if len(candidates) == 0:
+        rule1_growth = np.nan
+    else:
+        rule1_growth = min(min(candidates), 0.15)  # cap at 15%
 
+    # Current price
     if using_av:
         current_price = get_price_alpha_vantage(ticker, AV_KEY) if key_ok else np.nan
     else:
         current_price = get_price_fmp(ticker, FMP_KEY) if key_ok else np.nan
 
-    colv1, colv2, colv3, colv4 = st.columns(4)
-    colv1.metric("Intrinsic (EPS / P‑E)", f"${iv_eps:,.2f}" if not pd.isna(iv_eps) else "—")
-    colv2.metric("Intrinsic (FCF DCF / sh.)", f"${iv_dcf:,.2f}" if not pd.isna(iv_dcf) else "—")
-    colv3.metric("Current Price", f"${current_price:,.2f}" if not pd.isna(current_price) else "—")
-    colv4.metric("Terminal P/E used", f"{terminal_pe:.1f}")
+    # Current P/E (fallback from price / EPS)
+    current_pe = np.nan
+    if not pd.isna(current_price) and not pd.isna(last_eps) and last_eps > 0:
+        current_pe = current_price / last_eps
 
-    if not pd.isna(current_price):
-        if not pd.isna(iv_eps):
-            mos_eps = (iv_eps - current_price) / current_price
-            st.write(f"**Margin of Safety (EPS model):** {pct(mos_eps)}")
-        if not pd.isna(iv_dcf):
-            mos_dcf = (iv_dcf - current_price) / current_price
-            st.write(f"**Margin of Safety (FCF DCF):** {pct(mos_dcf)}")
+    # Rule #1 terminal P/E: lower of (2× growth%, current P/E), capped at 50; or manual if Auto off
+    if not pd.isna(rule1_growth) and auto_pe:
+        pe_from_growth = (rule1_growth * 100.0) * 2.0
+        pe_candidates = [pe_from_growth]
+        if not pd.isna(current_pe) and current_pe > 0:
+            pe_candidates.append(current_pe)
+        if len(pe_candidates) == 0:
+            term_pe = np.nan
+        else:
+            term_pe = min(min(pe_candidates), 50.0)
+    else:
+        term_pe = terminal_pe_manual
+
+    # Rule #1 EPS projection → Sticker → Fair Value → MOS
+    def rule1_eps_to_prices(eps_now, growth, years, terminal_pe, marr):
+        if pd.isna(eps_now) or eps_now <= 0: return np.nan, np.nan, np.nan
+        if pd.isna(growth) or growth < 0: return np.nan, np.nan, np.nan
+        if pd.isna(terminal_pe) or terminal_pe <= 0: return np.nan, np.nan, np.nan
+        fut_eps = eps_now * ((1 + growth) ** years)
+        sticker = fut_eps * terminal_pe
+        fair = sticker / ((1 + marr) ** years)
+        mos = fair / 2.0
+        return sticker, fair, mos
+
+    sticker_price, fair_value, mos_price = rule1_eps_to_prices(last_eps, rule1_growth, years_eps, term_pe, discount)
+
+    # FCF per share (uses last year FCF and SharesDiluted)
+    shares_last = df["SharesDiluted"].dropna().iloc[-1] if "SharesDiluted" in df and df["SharesDiluted"].notna().any() else np.nan
+    fcf_last = df["FCF"].dropna().iloc[-1] if df["FCF"].notna().any() else np.nan
+    fcf_per_share_last = (fcf_last / shares_last) if (not pd.isna(fcf_last) and not pd.isna(shares_last) and shares_last > 0) else np.nan
+
+    iv_dcf = intrinsic_dcf_fcf(fcf_per_share_last, growth_fcf, years_dcf, terminal_g, discount)
+
+    # Display
+    colv1, colv2, colv3, colv4 = st.columns(4)
+    colv1.metric("Sticker Price (Rule #1 EPS)", f"${sticker_price:,.2f}" if not pd.isna(sticker_price) else "—")
+    colv2.metric("Fair Value (PV @ MARR)", f"${fair_value:,.2f}" if not pd.isna(fair_value) else "—")
+    colv3.metric("MOS Price (50% of Fair)", f"${mos_price:,.2f}" if not pd.isna(mos_price) else "—")
+    colv4.metric("Current Price", f"${current_price:,.2f}" if not pd.isna(current_price) else "—")
+
+    colv5, colv6, colv7, colv8 = st.columns(4)
+    colv5.metric("Rule #1 Growth Used", pct(rule1_growth))
+    colv6.metric("Terminal P/E Used", f"{term_pe:.1f}" if not pd.isna(term_pe) else "—")
+    colv7.metric("Intrinsic (FCF DCF / sh.)", f"${iv_dcf:,.2f}" if not pd.isna(iv_dcf) else "—")
+    colv8.metric("EPS last", f"{last_eps:.2f}" if not pd.isna(last_eps) else "—")
+
+    if not pd.isna(current_price) and not pd.isna(mos_price):
+        mos_gap = (mos_price - current_price) / current_price
+        st.write(f"**Margin of Safety gap (Rule #1 MOS vs price):** {pct(mos_gap)}")
 
     with st.expander("Valuation Inputs Recap"):
         rec = {
             "EPS last": last_eps,
+            "EPS 10y CAGR (hist)": eps_hist_cagr,
+            "Your EPS growth input": growth_eps_user,
+            "Rule #1 growth used": rule1_growth,
+            "Terminal P/E used": term_pe,
+            "Sticker Price": sticker_price,
+            "Fair Value (PV)": fair_value,
+            "MOS Price": mos_price,
             "FCF last": fcf_last,
             "Shares diluted last": shares_last,
             "FCF per share last": fcf_per_share_last,
-            "EPS growth": growth_eps, "Years (EPS)": years_eps, "Terminal P/E": terminal_pe,
-            "FCF growth": growth_fcf, "Years (DCF)": years_dcf, "Terminal g": terminal_g,
-            "Discount rate": discount
+            "DCF (per share)": iv_dcf,
+            "MARR / Discount": discount
         }
         st.json({k: (None if pd.isna(v) else (float(v) if isinstance(v, (int, float, np.floating)) else v)) for k, v in rec.items()})
 
@@ -456,23 +497,30 @@ if run:
                     "breakdowns": {
                         "Sales": sales_b, "EPS": eps_b, "Equity": eqty_b, "FCF": fcf_b, "ROIC": roic_b
                     },
-                    "intrinsic": {
-                        "iv_eps": float(iv_eps) if not pd.isna(iv_eps) else None,
+                    "rule1": {
+                        "eps_last": float(last_eps) if not pd.isna(last_eps) else None,
+                        "growth_used": float(rule1_growth) if not pd.isna(rule1_growth) else None,
+                        "terminal_pe": float(term_pe) if not pd.isna(term_pe) else None,
+                        "sticker": float(sticker_price) if not pd.isna(sticker_price) else None,
+                        "fair_value": float(fair_value) if not pd.isna(fair_value) else None,
+                        "mos_price": float(mos_price) if not pd.isna(mos_price) else None,
+                    },
+                    "dcf": {
+                        "fcf_per_share_last": float(fcf_per_share_last) if not pd.isna(fcf_per_share_last) else None,
                         "iv_dcf": float(iv_dcf) if not pd.isna(iv_dcf) else None,
-                        "current_price": float(current_price) if not pd.isna(current_price) else None
-                    }
+                        "discount": float(discount)
+                    },
+                    "current_price": float(current_price) if not pd.isna(current_price) else None
                 }
                 prompt = (
                     "You are a disciplined value investor (Phil Town style). "
-                    "Using the structured data below, evaluate whether the business clears the 10% rule on Sales, EPS, Equity, FCF CAGRs and 10-yr Avg ROIC. "
-                    "Comment on the 10/5/3/1 breakdowns (e.g., improving or deteriorating). "
-                    "Interpret intrinsic values vs current price and note any risks (declining ROIC, leverage, inconsistent FCF). "
-                    "Keep it under 180 words, neutral tone.\n\n"
-                    f"{context}"
+                    "Use the structured data to judge 10% rule compliance (Sales/EPS/Equity/FCF CAGRs and 10-yr Avg ROIC), "
+                    "comment on the 10/5/3/1 trends, and compare Rule #1 MOS & DCF to the current price. "
+                    "Be concise (<180 words), neutral, and focused on business quality and price."
                 )
                 resp = client.chat.completions.create(
                     model="gpt-4o-mini",
-                    messages=[{"role":"user","content": prompt}],
+                    messages=[{"role":"user","content": prompt + "\n\n" + str(context)}],
                     temperature=0.3,
                     max_tokens=350,
                 )
