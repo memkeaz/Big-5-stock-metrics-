@@ -11,7 +11,7 @@ st.caption("Checks 10-year CAGRs for Sales, EPS, Equity, FCF, and the 10-yr Avg 
 # -------------------- Cache Control --------------------
 scol1, scol2 = st.columns([3, 1])
 with scol1:
-    st.info("If results don't show, try **Clear Cache** then search again.")
+    st.info("If results don't show, click **Clear Cache** then search again.")
 with scol2:
     if st.button("Clear Cache"):
         st.cache_data.clear()
@@ -41,11 +41,9 @@ def demo_msft_df():
 # -------------------- Helpers --------------------
 def cagr(series: pd.Series, years: int) -> float:
     try:
-        if years <= 0 or series.empty:
-            return np.nan
+        if years <= 0 or series.empty: return np.nan
         first, last = series.iloc[0], series.iloc[-1]
-        if pd.isna(first) or pd.isna(last) or first <= 0 or last <= 0:
-            return np.nan
+        if pd.isna(first) or pd.isna(last) or first <= 0 or last <= 0: return np.nan
         return (last / first) ** (1 / years) - 1
     except Exception:
         return np.nan
@@ -64,17 +62,14 @@ def av_get(fn: str, symbol: str, apikey: str):
     return j.get("annualReports", [])
 
 def av_series(reports, field) -> pd.Series:
-    if not reports:
-        return pd.Series(dtype="float64")
+    if not reports: return pd.Series(dtype="float64")
     rows = []
     for rep in reports:
         y = pd.to_datetime(rep.get("fiscalDateEnding", ""), errors="coerce").year
-        if pd.isna(y):
-            continue
+        if pd.isna(y): continue
         val = pd.to_numeric(rep.get(field, None), errors="coerce")
         rows.append((int(y), val))
-    if not rows:
-        return pd.Series(dtype="float64")
+    if not rows: return pd.Series(dtype="float64")
     s = pd.Series(dict(rows)).sort_index()
     return s.iloc[-11:].astype("float64")
 
@@ -86,19 +81,16 @@ def fetch_alpha_vantage(symbol: str, apikey: str):
 
     revenue        = av_series(inc, "totalRevenue")
     net_income     = av_series(inc, "netIncome")
-    diluted_eps    = av_series(inc, "dilutedEPS")                # AV uses 'dilutedEPS'
+    diluted_eps    = av_series(inc, "dilutedEPS")
     diluted_shares = av_series(inc, "weightedAverageShsOutDil")
     ebit           = av_series(inc, "ebit")
     tax_expense    = av_series(inc, "incomeTaxExpense")
     pretax_income  = av_series(inc, "incomeBeforeTax")
 
     equity     = av_series(bal, "totalShareholderEquity")
-    total_debt = av_series(bal, "totalDebt")
-    if total_debt.empty:
-        total_debt = av_series(bal, "shortLongTermDebtTotal")
+    total_debt = av_series(bal, "totalDebt") if not av_series(bal, "totalDebt").empty else av_series(bal, "shortLongTermDebtTotal")
     cash       = av_series(bal, "cashAndCashEquivalentsAtCarryingValue")
-    if cash.empty:
-        cash = av_series(bal, "cashAndShortTermInvestments")
+    if cash.empty: cash = av_series(bal, "cashAndShortTermInvestments")
 
     cfo   = av_series(cfs, "operatingCashflow")
     capex = av_series(cfs, "capitalExpenditures")
@@ -113,13 +105,13 @@ def fetch_alpha_vantage(symbol: str, apikey: str):
         A(x) for x in [revenue, net_income, diluted_eps, diluted_shares, ebit, tax_expense, pretax_income, equity, total_debt, cash, cfo, capex]
     ]
 
-    # EPS fallback
+    # EPS fallback (NI / diluted shares)
     eps = diluted_eps.copy()
     if eps.isna().all() and not net_income.isna().all() and not diluted_shares.isna().all():
         with np.errstate(invalid="ignore", divide="ignore"):
             eps = net_income / diluted_shares.replace({0: np.nan})
 
-    # FCF = CFO − CapEx  (note: CapEx may be negative; we still do CFO - CapEx)
+    # FCF = CFO − CapEx
     fcf = (cfo - capex) if (not cfo.isna().all() and not capex.isna().all()) else pd.Series([np.nan]*len(years), index=years)
 
     # ROIC = NOPAT / Invested Capital
@@ -147,7 +139,6 @@ def fmp_series(reports, field) -> pd.Series:
     if not reports: return pd.Series(dtype="float64")
     rows = []
     for rep in reports:
-        # prefer 'date' (YYYY-MM-DD), fallback to 'calendarYear'
         y = pd.to_datetime(rep.get("date") or rep.get("calendarYear"), errors="coerce").year
         if pd.isna(y):
             try: y = int(rep.get("calendarYear"))
@@ -232,7 +223,7 @@ if run:
             source = "Demo (sample)"
 
     # -------------------- Big 5 Metrics --------------------
-    n_years = max(len(years) - 1, 0)
+    n_years = max(len(df.index) - 1, 0)
     sales_cagr = cagr(df["Revenue"], n_years)
     eps_cagr   = cagr(df["EPS"], n_years)
     eqty_cagr  = cagr(df["Equity"], n_years)
@@ -258,6 +249,23 @@ if run:
 
     st.subheader(f"Big 5 Results — {ticker}  ·  Source: {source}")
     st.dataframe(results, use_container_width=True)
+
+    # ===== ROIC Breakdown =====
+    st.markdown("#### ROIC Breakdown (from the 10-year window)")
+    roic_series = df.get("ROIC", pd.Series(dtype=float)).astype(float).replace([np.inf, -np.inf], np.nan)
+    roic_valid = roic_series.dropna()
+
+    roic_10yr_avg = roic_valid.mean() if len(roic_valid) >= 1 else np.nan
+    roic_first5   = roic_valid.iloc[:5].mean() if len(roic_valid) >= 5 else np.nan
+    roic_last3    = roic_valid.iloc[-3:].mean() if len(roic_valid) >= 1 else np.nan
+    roic_last1    = roic_valid.iloc[-1] if len(roic_valid) >= 1 else np.nan
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("ROIC — 10-yr Avg", fmt(roic_10yr_avg))
+    c2.metric("ROIC — First 5-yr Avg", fmt(roic_first5))
+    c3.metric("ROIC — Last 3-yr Avg", fmt(roic_last3))
+    c4.metric("ROIC — Last 1-yr", fmt(roic_last1))
+    st.caption("ROIC = NOPAT / (Debt + Equity − Cash). First 5-yr uses the oldest five years in the displayed 10-year window.")
 
     with st.expander("Raw series used"):
         st.dataframe(df)
