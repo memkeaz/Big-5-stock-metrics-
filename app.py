@@ -11,18 +11,24 @@ st.markdown(
     <style>
       .block-container { padding-top: 0.8rem; padding-bottom: 3rem; max-width: 1100px; }
       @media (max-width: 640px) { .block-container { padding-left: 0.8rem; padding-right: 0.8rem; } }
-      .metric-card { padding: 0.8rem 1rem; border-radius: 0.9rem; background: #0b1220; color: #fff; }
-      .metric-title { font-size: 0.9rem; opacity: 0.8; }
-      .metric-value { font-size: 1.6rem; font-weight: 700; }
-      .section { margin-top: 0.5rem; }
+      .card { padding: 0.9rem 1rem; border-radius: 0.9rem; background: #0b1220; color: #fff; }
+      .card .title { font-size: 0.9rem; opacity: 0.8; margin-bottom: 0.2rem; }
+      .card .value { font-size: 1.6rem; font-weight: 700; }
       .small { color:#666; font-size:0.9rem; }
+      .muted { color:#888; }
+      .subtle { opacity: 0.8; }
+      .vrow { display:flex; gap:1rem; flex-wrap:wrap; }
+      .vbox { flex:1 1 320px; border:1px solid #e5e7eb; padding:14px; border-radius:12px; }
+      .vlabel { font-size:0.95rem; color:#374151; margin-bottom:8px; font-weight:600; }
+      .fv { font-size:1.2rem; font-weight:700; }
+      .mos { font-size:1.05rem; color:#374151; }
     </style>
     """,
     unsafe_allow_html=True
 )
 
 st.title("Phil Town Big 5 Screener — Alpha-Only")
-st.caption("Multi-key Alpha Vantage rotation. Big 5 with 10/5/3/1 breakdowns, and two valuations (Rule #1 EPS & FCF-DCF) using one MOS slider.")
+st.caption("Alpha Vantage with multi-key rotation. Big 5 (10y) + breakdowns (10/5/3/1) and two valuations (Rule #1 EPS & FCF-DCF). One MOS slider updates both in real time.")
 
 # ================== Collect Alpha keys & rotation ==================
 def _gather_alpha_keys():
@@ -41,10 +47,10 @@ def _gather_alpha_keys():
         for v in csv.split(","):
             if v.strip():
                 keys.append(v.strip())
-    uniq, seen = [], set()
+    seen, uniq = set(), []
     for k in keys:
         if k not in seen:
-            uniq.append(k); seen.add(k)
+            seen.add(k); uniq.append(k)
     return uniq
 
 ALPHA_KEYS = _gather_alpha_keys()
@@ -53,21 +59,24 @@ if not ALPHA_KEYS:
     st.stop()
 
 if "av_key_index" not in st.session_state:
-    st.session_state.av_key_index = 0  # current active key index
+    st.session_state.av_key_index = 0  # active key index
 
-# ================== Conservative defaults (Buffett-ish) ==================
+# ================== Conservative defaults ==================
 def sset(k, v):
     if k not in st.session_state: st.session_state[k] = v
 
+# Global valuation defaults you requested
 sset("discount", 0.10)           # 10% MARR
-sset("years_eps", 10)
-sset("growth_eps_user", 0.10)    # 10% user growth (capped to ≤15% later)
+sset("years_eps", 10)            # EPS projection years
+sset("growth_eps_user", 0.10)    # 10% user EPS growth (capped to ≤15% later)
 sset("auto_pe", True)
 sset("terminal_pe_man", 15.0)    # if Auto off
-sset("years_dcf", 10)
-sset("growth_fcf", 0.06)         # 6% FCF growth
-sset("terminal_g", 0.02)         # 2% terminal g
-sset("mos_pct", 50)              # one MOS slider for both
+
+sset("years_dcf", 10)            # DCF projection years
+sset("growth_fcf", 0.10)         # 10% FCF YoY default
+sset("terminal_g", 0.02)         # 2% terminal growth
+
+sset("mos_pct", 50)              # One MOS slider for both
 sset("last_query", {"ticker": "ADBE"})
 sset("data", None)               # (df, years, source, current_price)
 
@@ -122,7 +131,7 @@ def av_get(fn, symbol, apikey, **extra):
     r.raise_for_status()
     j = r.json()
     if isinstance(j, dict):
-        if j.get("Note"):        # rate limit
+        if j.get("Note"):
             raise AlphaRateLimit(j["Note"])
         if j.get("Information"):
             raise RuntimeError(f"Alpha Vantage error: {j['Information']}")
@@ -196,7 +205,7 @@ def fetch_alpha_once(symbol, apikey):
     # FCF = CFO - |CapEx|
     fcf = (cfo - capex) if (not cfo.isna().all() and not capex.isna().all()) else pd.Series([np.nan]*len(years), index=years)
 
-    # ROIC proxy = NOPAT / Avg Invested Capital
+    # ROIC proxy (NOPAT / avg invested capital)
     with np.errstate(divide="ignore", invalid="ignore"):
         tax_rate = (tax_expense / pretax_income).clip(0, 1)
     nopat = (ebit * (1 - tax_rate.fillna(0.21))) if not ebit.isna().all() else net_income
@@ -210,23 +219,19 @@ def fetch_alpha_once(symbol, apikey):
         "FCF": fcf, "ROIC": roic, "SharesDiluted": shares_diluted
     }).sort_index().tail(11)
 
-    # accept only if EPS or FCF has at least a couple of valid points
+    # ensure we have some EPS or FCF
     if (df["EPS"].notna().sum() < 2) and (df["FCF"].notna().sum() < 2):
         raise RuntimeError("Insufficient EPS/FCF data from Alpha for this key.")
+
     return df, years, "Alpha Vantage"
 
 def get_price_alpha_intraday(symbol, apikey):
-    """Try 1-min intraday for a fresher quote; fall back to GLOBAL_QUOTE outside."""
     j = av_get("TIME_SERIES_INTRADAY", symbol, apikey, interval="1min", outputsize="compact")
-    ts = j.get("Time Series (1min)", {})
-    if not ts:  # sometimes different casing
-        ts = j.get("Time Series (5min)", {})
+    ts = j.get("Time Series (1min)", {}) or j.get("Time Series (5min)", {})
     if not ts:
         raise RuntimeError("No intraday time series returned.")
-    # latest timestamp
     latest_ts = max(ts.keys())
-    last_bar = ts[latest_ts]
-    price = float(last_bar.get("4. close"))
+    price = float(ts[latest_ts].get("4. close"))
     return price
 
 def get_price_alpha_global(symbol, apikey):
@@ -234,7 +239,6 @@ def get_price_alpha_global(symbol, apikey):
     return float(j.get("Global Quote", {}).get("05. price", "nan"))
 
 def fetch_alpha_with_rotation(symbol):
-    """Fetch fundamentals + price, rotating across keys on rate-limit / failure."""
     n = len(ALPHA_KEYS)
     start = st.session_state.av_key_index % n
     last_err = None
@@ -243,26 +247,22 @@ def fetch_alpha_with_rotation(symbol):
         key = ALPHA_KEYS[idx]
         try:
             df, years, source = fetch_alpha_once(symbol, key)
-            # price: intraday first, fallback to global quote; rotate only if rate-limited
+            # Try intraday price first; if rate-limited or missing, rotate keys for price fetch only
             try:
                 price = get_price_alpha_intraday(symbol, key)
             except AlphaRateLimit:
-                # try next key for price only
                 price = np.nan
                 for j in range(1, n):
                     k2 = ALPHA_KEYS[(idx + j) % n]
                     try:
-                        price = get_price_alpha_intraday(symbol, k2)
-                        break
+                        price = get_price_alpha_intraday(symbol, k2); break
                     except AlphaRateLimit:
                         continue
                     except Exception:
                         continue
                 if pd.isna(price):
-                    # final fallback on this fundamentals key
                     price = get_price_alpha_global(symbol, key)
             except Exception:
-                # fallback to global quote with same key; if rate-limited, try others
                 try:
                     price = get_price_alpha_global(symbol, key)
                 except AlphaRateLimit:
@@ -270,20 +270,17 @@ def fetch_alpha_with_rotation(symbol):
                     for j in range(1, n):
                         k2 = ALPHA_KEYS[(idx + j) % n]
                         try:
-                            price = get_price_alpha_global(symbol, k2)
-                            break
+                            price = get_price_alpha_global(symbol, k2); break
                         except AlphaRateLimit:
                             continue
                         except Exception:
                             continue
-            st.session_state.av_key_index = idx  # remember the working fundamentals key
+            st.session_state.av_key_index = idx
             return df, years, f"{source} (key #{idx+1})", price
         except AlphaRateLimit as e:
-            last_err = e
-            continue
+            last_err = e; continue
         except Exception as e:
-            last_err = e
-            continue
+            last_err = e; continue
     raise RuntimeError(f"All Alpha keys failed. Last error: {last_err}")
 
 # ================== Search form ==================
@@ -329,29 +326,30 @@ if st.session_state["data"] is None:
 
 df, years, source, current_price = st.session_state["data"]
 
-# -------- Top bar: price first (clean card), then provider --------
+# -------- Top bar: price first --------
 c1, c2, c3 = st.columns([1,1,2])
 with c1:
-    st.markdown("<div class='metric-card'><div class='metric-title'>Current Price</div>"
-                f"<div class='metric-value'>{'—' if pd.isna(current_price) else f'${current_price:,.2f}'}</div></div>", unsafe_allow_html=True)
+    st.markdown("<div class='card'><div class='title'>Current Price</div>"
+                f"<div class='value'>{'—' if pd.isna(current_price) else f'${current_price:,.2f}'}</div></div>", unsafe_allow_html=True)
 with c2:
-    st.markdown("<div class='metric-card'><div class='metric-title'>Years Loaded</div>"
-                f"<div class='metric-value'>{len(df.index)}</div></div>", unsafe_allow_html=True)
+    st.markdown("<div class='card'><div class='title'>Years Loaded</div>"
+                f"<div class='value'>{len(df.index)}</div></div>", unsafe_allow_html=True)
 with c3:
-    st.markdown("<div class='metric-card'><div class='metric-title'>Provider</div>"
-                f"<div class='metric-value'>{source}</div></div>", unsafe_allow_html=True)
+    st.markdown("<div class='card'><div class='title'>Provider</div>"
+                f"<div class='value'>{source}</div></div>", unsafe_allow_html=True)
 
 # ================== Tabs ==================
 tabs = st.tabs(["Overview", "Big 5", "Breakdowns", "Valuation"])
 
 # -------- Overview --------
+def pct_fmt(x): return "—" if pd.isna(x) else f"{x*100:.1f}%"
 with tabs[0]:
     st.subheader(f"{st.session_state['last_query']['ticker']}")
     k1, k2, k3, k4 = st.columns(4)
     k1.metric("Latest EPS (best)", "—" if df['EPS'].dropna().empty else f"{df['EPS'].dropna().iloc[-1]:.2f}")
-    k2.metric("Latest ROIC",       "—" if df['ROIC'].dropna().empty else pct(df['ROIC'].dropna().iloc[-1]))
-    k3.metric("Revenue YoY",       "—" if df['Revenue'].dropna().shape[0]<2 else pct(yoy(df["Revenue"])))
-    k4.metric("FCF YoY",           "—" if df['FCF'].dropna().shape[0]<2 else pct(yoy(df["FCF"])))
+    k2.metric("Latest ROIC",       "—" if df['ROIC'].dropna().empty else pct_fmt(df['ROIC'].dropna().iloc[-1]))
+    k3.metric("Revenue YoY",       "—" if df['Revenue'].dropna().shape[0]<2 else pct_fmt(yoy(df["Revenue"])))
+    k4.metric("FCF YoY",           "—" if df['FCF'].dropna().shape[0]<2 else pct_fmt(yoy(df["FCF"])))
     with st.expander("Mini charts"):
         cc1, cc2, cc3 = st.columns(3)
         cc1.line_chart(df[["Revenue","FCF"]].dropna(), height=200, use_container_width=True)
@@ -361,10 +359,6 @@ with tabs[0]:
 # -------- Big 5 --------
 with tabs[1]:
     st.subheader("Big 5 — 10-Year Check")
-    def series_cagr_gap(s):
-        y = s.dropna()
-        if len(y) < 2: return np.nan
-        return cagr_over_years(y.iloc[0], y.iloc[-1], int(y.index[0]), int(y.index[-1]))
     sales_cagr_10 = series_cagr_gap(df["Revenue"])
     eps_cagr_10   = series_cagr_gap(df["EPS"])
     eqty_cagr_10  = series_cagr_gap(df["Equity"])
@@ -373,7 +367,7 @@ with tabs[1]:
     def pf(v): return "PASS ✅" if not pd.isna(v) and v >= 0.10 else ("—" if pd.isna(v) else "FAIL ❌")
     big5 = pd.DataFrame({
         "Metric": ["Sales (Revenue) CAGR","EPS CAGR","Equity CAGR","FCF CAGR","ROIC (10-yr Avg)"],
-        "Value (10y)":  [pct(sales_cagr_10), pct(eps_cagr_10), pct(eqty_cagr_10), pct(fcf_cagr_10), pct(roic_avg_10)],
+        "Value (10y)":  [pct_fmt(sales_cagr_10), pct_fmt(eps_cagr_10), pct_fmt(eqty_cagr_10), pct_fmt(fcf_cagr_10), pct_fmt(roic_avg_10)],
         "Pass ≥10%?": [pf(sales_cagr_10), pf(eps_cagr_10), pf(eqty_cagr_10), pf(fcf_cagr_10), pf(roic_avg_10)]
     })
     st.dataframe(big5, use_container_width=True, height=240)
@@ -406,17 +400,17 @@ with tabs[2]:
         bdf[col] = bdf[col].apply(lambda x: "—" if pd.isna(x) else f"{x*100:.1f}%")
     st.dataframe(bdf, use_container_width=True, height=260)
 
-# -------- Valuation (clean layout, one MOS slider) --------
+# -------- Valuation (Fair Value + MOS for BOTH models) --------
 with tabs[3]:
     st.subheader("Intrinsic Value (Two Models)")
     mos_frac = st.session_state["mos_pct"] / 100.0
 
     # --- Rule #1 EPS ---
-    eps_series = df["EPS"].astype(float)
-    last_eps   = latest_positive(eps_series, lookback=10)
+    eps_series   = df["EPS"].astype(float)
+    last_eps     = latest_positive(eps_series, lookback=10)
     eps_hist_cagr = series_cagr_gap(eps_series)
 
-    # Growth used = min(user, 10y EPS CAGR), capped at 15%
+    # Rule #1 growth: min(user, 10y EPS CAGR), cap 15%
     candidates = [g for g in [st.session_state["growth_eps_user"], eps_hist_cagr] if pd.notna(g) and g >= 0]
     rule1_growth = min(candidates) if candidates else np.nan
     if pd.notna(rule1_growth): rule1_growth = min(rule1_growth, 0.15)
@@ -464,29 +458,49 @@ with tabs[3]:
         pv += tv / ((1 + discount) ** years)
         return pv
 
-    iv_dcf  = intrinsic_dcf_fcf_per_share(fcf_ps_last, st.session_state["growth_fcf"],
-                                          st.session_state["years_dcf"], st.session_state["terminal_g"], st.session_state["discount"])
+    iv_dcf  = intrinsic_dcf_fcf_per_share(
+        fcf_ps_last,
+        st.session_state["growth_fcf"],      # default 10%
+        st.session_state["years_dcf"],       # default 10 years
+        st.session_state["terminal_g"],      # default 2%
+        st.session_state["discount"]         # default 10%
+    )
     mos_price_dcf = iv_dcf * (1 - mos_frac) if pd.notna(iv_dcf) else np.nan
 
-    # --- Clean display (two cards) ---
-    v1, v2, v3 = st.columns([1,1,1])
-    v1.metric("Rule #1 Fair Value / share", "—" if pd.isna(fair_rule1) else f"${fair_rule1:,.2f}")
-    v2.metric("DCF Fair Value / share",     "—" if pd.isna(iv_dcf)     else f"${iv_dcf:,.2f}")
-    v3.metric("Current Price",              "—" if pd.isna(current_price) else f"${current_price:,.2f}")
+    # --- Display: each model shows Fair Value first, then MOS Price ---
+    st.markdown("<div class='vrow'>", unsafe_allow_html=True)
 
-    m1, m2 = st.columns(2)
-    m1.metric(f"MOS Price (Rule #1, {int(st.session_state['mos_pct'])}%)", "—" if pd.isna(mos_price_rule1) else f"${mos_price_rule1:,.2f}")
-    m2.metric(f"MOS Price (DCF, {int(st.session_state['mos_pct'])}%)",     "—" if pd.isna(mos_price_dcf)   else f"${mos_price_dcf:,.2f}")
-
-    # One simple line with key assumptions (kept brief to reduce clutter)
+    # Rule #1 box
+    st.markdown("<div class='vbox'>", unsafe_allow_html=True)
+    st.markdown("<div class='vlabel'>Rule #1 (EPS)</div>", unsafe_allow_html=True)
+    st.markdown(f"<div class='fv'>Fair Value / share: {'—' if pd.isna(fair_rule1) else f'${fair_rule1:,.2f}'}</div>", unsafe_allow_html=True)
+    st.markdown(f"<div class='mos'>MOS Price ({int(st.session_state['mos_pct'])}%): "
+                f"{'—' if pd.isna(mos_price_rule1) else f'${mos_price_rule1:,.2f}'}</div>", unsafe_allow_html=True)
     st.markdown(
-        f"<p class='small'>Assumptions — MARR {st.session_state['discount']*100:.1f}%, "
-        f"EPS growth {rule1_growth*100:.1f}% (cap 15), Terminal P/E {('—' if pd.isna(term_pe) else f'{term_pe:.1f}')}, "
-        f"FCF growth {st.session_state['growth_fcf']*100:.1f}%, Terminal g {st.session_state['terminal_g']*100:.1f}%, "
-        f"MOS {st.session_state['mos_pct']}%.</p>", unsafe_allow_html=True
+        f"<div class='small subtle'>Growth used {('—' if pd.isna(rule1_growth) else f'{rule1_growth*100:.1f}%')}, "
+        f"Terminal P/E {('—' if pd.isna(term_pe) else f'{term_pe:.1f}')}, Discount {st.session_state['discount']*100:.1f}%</div>",
+        unsafe_allow_html=True
     )
+    st.markdown("</div>", unsafe_allow_html=True)
 
-    # Quiet hints if missing
-    if pd.isna(fair_rule1): st.caption("Rule #1 needs a positive EPS.")
-    if pd.isna(iv_dcf):     st.caption("DCF needs a positive FCF/share.")
+    # DCF box
+    st.markdown("<div class='vbox'>", unsafe_allow_html=True)
+    st.markdown("<div class='vlabel'>DCF (FCF per share)</div>", unsafe_allow_html=True)
+    st.markdown(f"<div class='fv'>Fair Value / share: {'—' if pd.isna(iv_dcf) else f'${iv_dcf:,.2f}'}</div>", unsafe_allow_html=True)
+    st.markdown(f"<div class='mos'>MOS Price ({int(st.session_state['mos_pct'])}%): "
+                f"{'—' if pd.isna(mos_price_dcf) else f'${mos_price_dcf:,.2f}'}</div>", unsafe_allow_html=True)
+    st.markdown(
+        f"<div class='small subtle'>FCF growth {st.session_state['growth_fcf']*100:.1f}%, "
+        f"Terminal g {st.session_state['terminal_g']*100:.1f}%, Discount {st.session_state['discount']*100:.1f}%</div>",
+        unsafe_allow_html=True
+    )
+    st.markdown("</div>", unsafe_allow_html=True)
 
+    st.markdown("</div>", unsafe_allow_html=True)  # end vrow
+
+    # One slider controls both MOS prices, live
+    st.slider("Margin of Safety % (applies to both models)", 1, 100, key="mos_pct")
+
+    # Gentle hints if missing
+    if pd.isna(fair_rule1): st.caption("Rule #1 needs a positive EPS (best of EPS or NI/Shares).")
+    if pd.isna(iv_dcf):     st.caption("DCF needs a positive FCF/share (CFO − |CapEx| per share).")
