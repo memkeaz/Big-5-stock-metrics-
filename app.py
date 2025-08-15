@@ -18,17 +18,18 @@ st.markdown(
       .muted { color:#888; }
       .subtle { opacity: 0.8; }
       .vrow { display:flex; gap:1rem; flex-wrap:wrap; }
-      .vbox { flex:1 1 320px; border:1px solid #e5e7eb; padding:14px; border-radius:12px; }
+      .vbox { flex:1 1 320px; border:1px solid #e5e7eb; padding:14px; border-radius:12px; background:#fff; }
       .vlabel { font-size:0.95rem; color:#374151; margin-bottom:8px; font-weight:600; }
       .fv { font-size:1.2rem; font-weight:700; }
       .mos { font-size:1.05rem; color:#374151; }
+      .sticky-cta { margin-top: 1rem; padding-top: 0.5rem; border-top: 1px solid #e5e7eb; }
     </style>
     """,
     unsafe_allow_html=True
 )
 
 st.title("Phil Town Big 5 Screener — Alpha-Only")
-st.caption("Alpha Vantage with multi-key rotation. Big 5 (10y) + breakdowns (10/5/3/1) and two valuations (Rule #1 EPS & FCF-DCF). One MOS slider updates both in real time.")
+st.caption("Alpha Vantage with multi-key rotation. Big 5 (10y) + breakdowns (10/5/3/1) and two valuations (Rule #1 EPS & FCF-DCF). One MOS slider updates both live.")
 
 # ================== Collect Alpha keys & rotation ==================
 def _gather_alpha_keys():
@@ -65,7 +66,7 @@ if "av_key_index" not in st.session_state:
 def sset(k, v):
     if k not in st.session_state: st.session_state[k] = v
 
-# Global valuation defaults you requested
+# Global valuation defaults (you requested)
 sset("discount", 0.10)           # 10% MARR
 sset("years_eps", 10)            # EPS projection years
 sset("growth_eps_user", 0.10)    # 10% user EPS growth (capped to ≤15% later)
@@ -247,7 +248,7 @@ def fetch_alpha_with_rotation(symbol):
         key = ALPHA_KEYS[idx]
         try:
             df, years, source = fetch_alpha_once(symbol, key)
-            # Try intraday price first; if rate-limited or missing, rotate keys for price fetch only
+            # Try intraday price; rotate keys for price on rate-limit
             try:
                 price = get_price_alpha_intraday(symbol, key)
             except AlphaRateLimit:
@@ -403,7 +404,10 @@ with tabs[2]:
 # -------- Valuation (Fair Value + MOS for BOTH models) --------
 with tabs[3]:
     st.subheader("Intrinsic Value (Two Models)")
+
+    # Grab MOS as a fraction once, used everywhere; slider lives at the bottom of this tab
     mos_frac = st.session_state["mos_pct"] / 100.0
+    percent_of_fair = (1.0 - mos_frac) * 100.0  # e.g., MOS 40% -> 60% of Fair
 
     # --- Rule #1 EPS ---
     eps_series   = df["EPS"].astype(float)
@@ -437,7 +441,9 @@ with tabs[3]:
         fair    = sticker / ((1 + marr) ** years)
         return fut_eps, sticker, fair
 
-    fut_eps, sticker, fair_rule1 = rule1_eps_prices(last_eps, rule1_growth, st.session_state["years_eps"], term_pe, st.session_state["discount"])
+    fut_eps, sticker, fair_rule1 = rule1_eps_prices(
+        last_eps, rule1_growth, st.session_state["years_eps"], term_pe, st.session_state["discount"]
+    )
     mos_price_rule1 = fair_rule1 * (1 - mos_frac) if pd.notna(fair_rule1) else np.nan
 
     # --- FCF-DCF per share ---
@@ -459,23 +465,24 @@ with tabs[3]:
         return pv
 
     iv_dcf  = intrinsic_dcf_fcf_per_share(
-        fcf_ps_last,
-        st.session_state["growth_fcf"],      # default 10%
-        st.session_state["years_dcf"],       # default 10 years
-        st.session_state["terminal_g"],      # default 2%
-        st.session_state["discount"]         # default 10%
+        fcf_ps_last, st.session_state["growth_fcf"], st.session_state["years_dcf"],
+        st.session_state["terminal_g"], st.session_state["discount"]
     )
     mos_price_dcf = iv_dcf * (1 - mos_frac) if pd.notna(iv_dcf) else np.nan
 
-    # --- Display: each model shows Fair Value first, then MOS Price ---
+    # --- Display: each model shows Fair Value first, then MOS Price + % of Fair ---
     st.markdown("<div class='vrow'>", unsafe_allow_html=True)
 
     # Rule #1 box
     st.markdown("<div class='vbox'>", unsafe_allow_html=True)
     st.markdown("<div class='vlabel'>Rule #1 (EPS)</div>", unsafe_allow_html=True)
     st.markdown(f"<div class='fv'>Fair Value / share: {'—' if pd.isna(fair_rule1) else f'${fair_rule1:,.2f}'}</div>", unsafe_allow_html=True)
-    st.markdown(f"<div class='mos'>MOS Price ({int(st.session_state['mos_pct'])}%): "
-                f"{'—' if pd.isna(mos_price_rule1) else f'${mos_price_rule1:,.2f}'}</div>", unsafe_allow_html=True)
+    st.markdown(
+        f"<div class='mos'>MOS Price: "
+        f"{'—' if pd.isna(mos_price_rule1) else f'${mos_price_rule1:,.2f}'} "
+        f"<span class='muted'>(≈ {percent_of_fair:.0f}% of Fair)</span></div>",
+        unsafe_allow_html=True
+    )
     st.markdown(
         f"<div class='small subtle'>Growth used {('—' if pd.isna(rule1_growth) else f'{rule1_growth*100:.1f}%')}, "
         f"Terminal P/E {('—' if pd.isna(term_pe) else f'{term_pe:.1f}')}, Discount {st.session_state['discount']*100:.1f}%</div>",
@@ -487,8 +494,12 @@ with tabs[3]:
     st.markdown("<div class='vbox'>", unsafe_allow_html=True)
     st.markdown("<div class='vlabel'>DCF (FCF per share)</div>", unsafe_allow_html=True)
     st.markdown(f"<div class='fv'>Fair Value / share: {'—' if pd.isna(iv_dcf) else f'${iv_dcf:,.2f}'}</div>", unsafe_allow_html=True)
-    st.markdown(f"<div class='mos'>MOS Price ({int(st.session_state['mos_pct'])}%): "
-                f"{'—' if pd.isna(mos_price_dcf) else f'${mos_price_dcf:,.2f}'}</div>", unsafe_allow_html=True)
+    st.markdown(
+        f"<div class='mos'>MOS Price: "
+        f"{'—' if pd.isna(mos_price_dcf) else f'${mos_price_dcf:,.2f}'} "
+        f"<span class='muted'>(≈ {percent_of_fair:.0f}% of Fair)</span></div>",
+        unsafe_allow_html=True
+    )
     st.markdown(
         f"<div class='small subtle'>FCF growth {st.session_state['growth_fcf']*100:.1f}%, "
         f"Terminal g {st.session_state['terminal_g']*100:.1f}%, Discount {st.session_state['discount']*100:.1f}%</div>",
@@ -498,9 +509,7 @@ with tabs[3]:
 
     st.markdown("</div>", unsafe_allow_html=True)  # end vrow
 
-    # One slider controls both MOS prices, live
-    st.slider("Margin of Safety % (applies to both models)", 1, 100, key="mos_pct")
-
-    # Gentle hints if missing
-    if pd.isna(fair_rule1): st.caption("Rule #1 needs a positive EPS (best of EPS or NI/Shares).")
-    if pd.isna(iv_dcf):     st.caption("DCF needs a positive FCF/share (CFO − |CapEx| per share).")
+    # Bottom MOS slider (live) — controls both models
+    st.markdown("<div class='sticky-cta'>", unsafe_allow_html=True)
+    st.slider("Margin of Safety % (discount from Fair Value — controls BOTH models)", 1, 100, key="mos_pct")
+    st.markdown("</div>", unsafe_allow_html=True)
